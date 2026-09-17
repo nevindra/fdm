@@ -1,8 +1,12 @@
 //! fdm — fast download manager.
 //!
 //! ```
-//! fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file]
+//! fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file] [--headless]
 //! ```
+//!
+//! `--headless` runs without the terminal front: one line per event on
+//! stderr, exit when every download given on the command line has
+//! finished — what a script, a cron job, or the benchmark wants.
 //!
 //! Starts the worker on its own thread, hands it any URLs on the command
 //! line, and runs the terminal front until `q`. `a` adds another URL while
@@ -49,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
     var urls: std.ArrayList([]const u8) = .empty;
     defer urls.deinit(gpa);
     var db_path: ?[]const u8 = null;
+    var headless = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -68,6 +73,8 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 db_path = v;
             }
+        } else if (std.mem.eql(u8, a, "--headless")) {
+            headless = true;
         } else if (a.len > 0 and a[0] == '-') {
             return usage();
         } else try urls.append(gpa, a);
@@ -82,7 +89,61 @@ pub fn main(init: std.process.Init) !void {
     defer worker.stop();
     openLog(arena, db);
 
+    if (headless) return runHeadless(gpa, init.io, worker, urls.items);
     try tui.run(gpa, init.io, init.environ_map, worker, urls.items);
+}
+
+/// No terminal front: the URLs go in, events come out as lines, and the
+/// process ends when the last of them is done or failed. Rows restored
+/// from the database are reported but not waited for.
+fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, urls: []const []const u8) !void {
+    var waiting: std.ArrayList(i64) = .empty;
+    defer waiting.deinit(gpa);
+    var pending: usize = urls.len;
+    for (urls) |u| try worker.send(.{ .add = try worker.gpa.dupe(u8, u) });
+
+    var failed = false;
+    var last_line_ms: i64 = 0;
+    while (pending > 0) {
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake);
+        const now = download.nowMs(io);
+        const events = try worker.take();
+        defer gpa.free(events);
+        for (events) |ev| switch (ev) {
+            .added => |a| if (a.state == .queued and waiting.items.len < urls.len) {
+                try waiting.append(gpa, a.id);
+                std.debug.print("{d}: {s} -> {s}\n", .{ a.id, a.url.slice(), a.path.slice() });
+            },
+            .started => |st| std.debug.print("{d}: started, {?d} bytes, {d} segments{s}\n", .{ st.id, st.total, st.segments, if (st.resumed) ", resumed" else "" }),
+            .progress => |p| if (now - last_line_ms >= 1000) {
+                last_line_ms = now;
+                std.debug.print("{d}: {d} bytes\n", .{ p.id, p.bytes });
+            },
+            .note => |n| std.debug.print("{d}: {s}\n", .{ n.id, n.text.slice() }),
+            .done => |d| {
+                std.debug.print("{d}: done, {d} bytes in {d} ms\n", .{ d.id, d.bytes, d.elapsed_ms });
+                if (isWaited(waiting.items, d.id)) pending -= 1;
+            },
+            .failed => |f| {
+                std.debug.print("{d}: failed: {s}\n", .{ f.id, f.text.slice() });
+                if (isWaited(waiting.items, f.id)) {
+                    pending -= 1;
+                    failed = true;
+                }
+            },
+            .fatal => |t| {
+                std.debug.print("fatal: {s}\n", .{t.slice()});
+                return error.Fatal;
+            },
+            else => {},
+        };
+    }
+    if (failed) return error.DownloadFailed;
+}
+
+fn isWaited(ids: []const i64, id: i64) bool {
+    for (ids) |i| if (i == id) return true;
+    return false;
 }
 
 /// `$XDG_DATA_HOME/fdm/fdm.db`, or `~/.local/share/fdm/fdm.db`.
@@ -94,7 +155,7 @@ fn defaultDbPath(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]con
 
 fn usage() error{Usage} {
     std.debug.print(
-        \\usage: fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file]
+        \\usage: fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file] [--headless]
         \\
     , .{});
     return error.Usage;
