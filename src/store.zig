@@ -6,16 +6,21 @@
 //! statement against them while compiling — so a column renamed here and
 //! not there is a build error rather than a `no such column` at run time.
 //!
+//! The queue is a third table in the same file — `nilo_job`'s own Row over
+//! this Db — so a download and the job that fetches it commit together.
+//!
 //! The wire is `.in_fiber`: there is no Engine here, the caller is a task on
 //! the worker's `std.Io.Threaded`, and a statement runs on whichever thread
 //! asks. The pool is one writer and one reader, which is what SQLite is.
 
 const std = @import("std");
 const core = @import("nilo_core");
+const job = @import("nilo_job");
 const sql = @import("nilo_sql");
 
 pub const Db = sql.Sqlite(.{ .threading = .in_fiber });
 pub const Run = core.Run;
+pub const JobTable = job.Table(Db);
 
 pub const State = enum { queued, running, done, failed, cancelled };
 
@@ -64,8 +69,19 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Db {
 
     var run: Run = .initIo(gpa, io);
     defer run.deinit();
-    try sql.migrate.createMissing(&db, &run, &.{ Download, Segment });
+    try sql.migrate.createMissing(&db, &run, &.{ Download, Segment, JobTable.Row });
     return db;
+}
+
+/// **One process owns this file**, so a job row that is `running` when the
+/// process starts belongs to a process that is gone. Without this it would
+/// sit until its lease ran out — a day, since a download may take that
+/// long — and the download it carries would not resume until then.
+pub fn releaseStale(db: *Db, run: *Run) !usize {
+    return db.update(JobTable.Row, run, .{
+        .set = .{ .state = .queued, .lease_until = @as(i64, 0) },
+        .where = .{ .state = .running },
+    });
 }
 
 pub fn all(db: *Db, run: *Run) ![]Download {
@@ -148,4 +164,11 @@ test "the tables build, and a download round-trips with its segments" {
     try std.testing.expectEqual(@as(?i64, 100), rows[0].total);
     try std.testing.expectEqualStrings("\"abc\"", rows[0].etag.?);
     try std.testing.expectEqual(State.running, rows[0].state);
+
+    // The queue table is there too, and a stale running row goes back.
+    var table = JobTable.open(&db);
+    const id = (try table.push(&run, "fetch", "{}", .{ .run_at = 0 })).?;
+    _ = try table.claim(&run, 1, std.math.maxInt(i64));
+    try std.testing.expectEqual(@as(usize, 1), try releaseStale(&db, &run));
+    try std.testing.expectEqual(id, (try table.claim(&run, 2, std.math.maxInt(i64))).?.id);
 }

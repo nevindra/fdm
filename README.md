@@ -1,12 +1,13 @@
 # fdm — fast download manager
 
 A download manager for Linux on [nilo](../nilo) and the
-[Native SDK](https://native-sdk.dev/). **MVP 2 is a terminal front over a
-worker that remembers**; the window comes next, over the same worker.
+[Native SDK](https://native-sdk.dev/). **MVP 3 is a terminal front over a
+worker that remembers and queues**; the window comes next, over the same
+worker.
 
 ```
 zig build
-./zig-out/bin/fdm [url ...] [-n segments] [--stall ms] [--retries n] [--db file]
+./zig-out/bin/fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file]
 ```
 
 `a` adds a URL, `c` cancels the selected one, `r` resumes a failed or
@@ -22,12 +23,20 @@ it does, the server is asked again: a different `ETag` or length means a
 different file, and that starts over rather than stitching two files into
 one. `c` marks a row cancelled and keeps its bytes; `r` resumes it.
 
+**The queue is `nilo_job`.** Each download is a `Fetch` row in the same
+file, `-p` workers claim them in order (three by default), and a download
+that fails as a whole — every segment out of retries, the server gone for
+a minute — is tried again with backoff, three times, before it is dead. A
+404 is final and is not retried. Quitting cancels the workers, and a
+cancelled worker hands its row back to the queue; that is what "resume on
+the next start" is. `std.log` goes to `<db>.log`, never the terminal.
+
 ## Layout
 
 | File | What |
 |---|---|
 | `src/download.zig` | the worker: its own thread and `std.Io.Threaded`, one `fetch.Client`, every download a task with its segments under it. Talks to the rest through `Command` in and `Event` out, and knows nothing about a terminal or a window |
-| `src/store.zig` | the two tables as structs — `downloads` and `segments` — on `nilo_sql`'s SQLite wire with `.threading = .in_fiber`, and the six statements the worker makes against them. `createMissing` builds them on first open |
+| `src/store.zig` | the tables as structs — `downloads`, `segments`, and `nilo_job`'s own `nilo_jobs` — on `nilo_sql`'s SQLite wire with `.threading = .in_fiber`, and the statements the worker makes against them. `createMissing` builds them on first open |
 | `src/tui.zig` | the terminal front: `Item` is the model, `Model.apply` is `update`, `draw` is the view. Raw mode and a `poll` on stdin, no curses |
 | `src/main.zig` | wiring |
 
@@ -65,6 +74,14 @@ two URLs at once, a third typed in with `a`, `c` on one mid-flight, a
 its note and retried, `q` with downloads still running — every exit
 clean, no leaks under the Debug allocator, hashes of what finished
 matching.
+
+With the queue, `-p 1` and three URLs: they run one at a time; `q` while
+the second is at 5% hands its job back (`queued`, attempts 0) and a restart
+resumes it and then runs the third; `kill -9` mid-run leaves a `running`
+job row that the next start releases and resumes; a stall that exhausts
+the segment retries fails the download, which `nilo_job` retries two
+seconds later from where it was; a 404 is dead after one attempt; `c` on a
+queued row cancels it before it is claimed. Hashes match throughout.
 
 And for the database, on the same server slowed to 1.3 MB/s: `q` at 29%
 then a restart resumes and finishes; `kill -9` at 40% resumes from the
@@ -117,9 +134,10 @@ on an empty one.
   holds for a TLS connection (nilo measures 59,151 bytes). A manager with
   32 segments open is paying ~6 MB in buffers alone; sizing these is a
   decision, not a default.
-- **A queue with a limit on how many run at once** — `nilo_job` runs on
-  the same Io and is the obvious shape for it; today everything added
-  starts immediately.
+- **A job's `timeout_ms` is only a lease here.** Without an Engine the
+  deadline never fires, so it is set to a day and `store.releaseStale`
+  resets `running` rows at start — right for one process owning the file,
+  wrong the moment two do.
 - **Delete** a row, with or without its file.
 - **On this machine `-fllvm` is forced** in `build.zig`: glibc 2.44's
   `crt1.o` carries an `.sframe` section Zig 0.16's own ELF linker

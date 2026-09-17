@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "nilo_core", .module = nilo.module("nilo_core") },
                 .{ .name = "nilo_fetch", .module = nilo.module("nilo_fetch") },
+                .{ .name = "nilo_job", .module = nilo.module("nilo_job") },
                 .{ .name = "nilo_sql", .module = nilo.module("nilo_sql") },
             },
         }),

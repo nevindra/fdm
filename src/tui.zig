@@ -65,6 +65,11 @@ pub const Model = struct {
                 }) catch return;
                 if (a.state == .queued) m.selected = m.items.items.len - 1;
             },
+            .queued => |q| if (m.find(q.id)) |it| {
+                it.state = .queued;
+                it.note = .{};
+                it.rate = 0;
+            },
             .started => |s| if (m.find(s.id)) |it| {
                 it.name = s.name;
                 it.total = s.total;
@@ -289,8 +294,12 @@ fn itemLine(w: *std.Io.Writer, it: *const Item, cols: usize) !void {
         .done => {
             try fbs.writeAll("done  ");
             try human(&fbs, it.bytes);
-            const secs = @as(f64, @floatFromInt(@max(it.elapsed_ms, 1))) / 1000.0;
-            try fbs.print(" in {d:.1}s  {d:.1} MB/s", .{ secs, @as(f64, @floatFromInt(it.bytes)) / secs / 1e6 });
+            // A row restored from the database finished in an earlier run,
+            // and nobody wrote down how long it took.
+            if (it.elapsed_ms > 0) {
+                const secs = @as(f64, @floatFromInt(it.elapsed_ms)) / 1000.0;
+                try fbs.print(" in {d:.1}s  {d:.1} MB/s", .{ secs, @as(f64, @floatFromInt(it.bytes)) / secs / 1e6 });
+            }
         },
         .failed => try fbs.writeAll("failed"),
         .cancelled => {

@@ -8,14 +8,21 @@
 //! redraws. Both are ~50 lines over this file, and neither reaches into it:
 //! nothing here knows what a terminal or a window is.
 //!
-//! **The database is the list.** Every download is a row in `store.zig`'s
-//! SQLite file before it is anything else, its id is the row's, and the
-//! segments' progress is written there once a second and on every way out.
-//! So a restart shows the same list, and a download that was running when
-//! the process died resumes from the last byte each segment had written —
-//! after asking the server again and checking that its `ETag` and length
-//! are what they were, because a file that changed underneath a resume is
-//! a corrupt download that looks complete.
+//! **The database is the list, and the queue.** Every download is a row in
+//! `store.zig`'s SQLite file before it is anything else, its id is the
+//! row's, and the segments' progress is written there once a second and on
+//! every way out. So a restart shows the same list, and a download that was
+//! running when the process died resumes from the last byte each segment
+//! had written — after asking the server again and checking that its
+//! `ETag` and length are what they were, because a file that changed
+//! underneath a resume is a corrupt download that looks complete.
+//!
+//! Which downloads run, how many at once and in what order is `nilo_job`'s:
+//! a `Fetch` row per download in the same file, `parallel` workers claiming
+//! them in order, and a whole-download retry with backoff on top of the
+//! per-segment one inside. Quitting cancels the workers, and a worker that
+//! is cancelled hands its row back to the queue — so "resume on the next
+//! start" is the queue's ordinary behaviour rather than a path of its own.
 //!
 //! What the spike settled, and this file keeps
 //! ([README](../README.md#what-was-found)):
@@ -30,6 +37,7 @@
 
 const std = @import("std");
 const fetch = @import("nilo_fetch");
+const job = @import("nilo_job");
 const store = @import("store.zig");
 
 const Io = std.Io;
@@ -64,6 +72,8 @@ pub const Text = struct {
 };
 
 pub const Settings = struct {
+    /// How many downloads run at once; the rest wait their turn in order.
+    parallel: u8 = 3,
     segments: u8 = 4,
     /// Milliseconds a segment may go without a byte before it is cancelled.
     stall_ms: u32 = 10_000,
@@ -90,6 +100,8 @@ pub const Command = union(enum) {
 /// exactly one of `done` / `failed` / `cancelled` at the end of each run.
 pub const Event = union(enum) {
     added: struct { id: i64, url: Text, name: Text, state: State, total: ?u64, bytes: u64, segments: u8 },
+    /// Waiting its turn — on `add`, `r`, and at start for what was unfinished.
+    queued: struct { id: i64 },
     started: struct { id: i64, name: Text, total: ?u64, segments: u8, resumed: bool },
     progress: struct { id: i64, bytes: u64 },
     note: struct { id: i64, text: Text },
@@ -185,13 +197,77 @@ pub const Worker = struct {
 
 // ----------------------------------------------------------------- thread
 
+/// The job: fetch one download, by row id. **The payload is the id and
+/// nothing else** — the row is the truth and is read back at the start of
+/// `run`, which is what makes a claim after a crash the same call as the
+/// first one.
+///
+/// `timeout_ms` cannot fire without an Engine, so here it is only the
+/// lease: how long a claimed row is left alone. A day, because a download
+/// may take that long, and `store.releaseStale` is what covers the crash
+/// case that a shorter lease would otherwise cover.
+const Fetch = struct {
+    pub const nilo_job = "fetch";
+    pub const timeout_ms = 24 * 60 * 60 * 1000;
+    /// Whole-download retries, over and above the per-segment ones inside:
+    /// a server that was down for a minute gets three more chances,
+    /// spread out.
+    pub const retry: job.Retry = .{ .times = 3, .backoff = .{ .exponential = .{ .from_ms = 2_000, .to_ms = 60_000 } } };
+    /// A 404 does not get better by waiting.
+    pub const final = error{BadStatus};
+
+    download_id: i64,
+
+    pub fn run(self: Fetch, scope: *store.Run, shared: *Shared) !void {
+        _ = scope;
+        return Download.runJob(shared, self.download_id);
+    }
+};
+
+const Jobs = job.Jobs(.{
+    .kinds = .{Fetch},
+    .store = store.JobTable,
+    .deps = struct { shared: *Shared },
+});
+
 /// Everything a download task needs that is shared: the worker, the client,
-/// the database, the Io. One of these for the life of the thread.
+/// the database, the Io, and which downloads are running right now. One of
+/// these for the life of the thread.
 const Shared = struct {
     worker: *Worker,
     client: *fetch.Client,
     db: *store.Db,
+    jobs: *Jobs,
     io: Io,
+    /// The tasks in flight, so a `cancel` can reach the one it names.
+    lock: Lock = .{},
+    active: std.ArrayList(*Download) = .empty,
+
+    fn register(s: *Shared, d: *Download) !void {
+        s.lock.lock();
+        defer s.lock.unlock();
+        try s.active.append(s.worker.gpa, d);
+    }
+
+    fn unregister(s: *Shared, d: *Download) void {
+        s.lock.lock();
+        defer s.lock.unlock();
+        for (s.active.items, 0..) |a, i| if (a == d) {
+            _ = s.active.swapRemove(i);
+            return;
+        };
+    }
+
+    /// Flag the running task for `id`, if there is one.
+    fn cancelActive(s: *Shared, id: i64) bool {
+        s.lock.lock();
+        defer s.lock.unlock();
+        for (s.active.items) |a| if (a.id == id) {
+            a.cancel.store(true, .release);
+            return true;
+        };
+        return false;
+    }
 };
 
 fn threadMain(w: *Worker) void {
@@ -209,7 +285,7 @@ fn threadMain(w: *Worker) void {
     defer db.deinit();
 
     var client: fetch.Client = .init(gpa, .{
-        .max_in_flight = 32,
+        .max_in_flight = 64,
         // The deadline cannot fire without an Engine, so zero is honest; the
         // stall watchdog in `Download.supervise` is the bound instead.
         .timeout_ms = 0,
@@ -220,62 +296,67 @@ fn threadMain(w: *Worker) void {
     defer client.deinit();
     client.nilo_start(io, .off) catch return;
 
-    var shared: Shared = .{ .worker = w, .client = &client, .db = &db, .io = io };
+    var table = store.JobTable.open(&db);
+    var shared: Shared = .{ .worker = w, .client = &client, .db = &db, .jobs = undefined, .io = io };
+    defer shared.active.deinit(gpa);
+    var jobs: Jobs = .open(gpa, &table, .{ .shared = &shared }, .{
+        .workers = w.settings.parallel,
+        .poll_ms = 500,
+    });
+    shared.jobs = &jobs;
+    jobs.nilo_start(io, .off) catch return;
+
     var run: store.Run = .initIo(gpa, io);
     defer run.deinit();
 
-    var downloads: std.ArrayList(*Download) = .empty;
-    defer downloads.deinit(gpa);
-
     // The list is whatever the database has. Anything that was on its way
-    // when the process last stopped goes again.
-    restore(&shared, &run, &downloads);
+    // when the process last stopped is queued again.
+    restore(&shared, &run);
 
-    var quitting = false;
+    var serving = io.concurrent(Jobs.serveOn, .{ &jobs, io }) catch {
+        w.post(.{ .fatal = .from("no thread for the queue") });
+        return;
+    };
+
     while (true) {
         const cmds = w.takeCommands();
         defer gpa.free(cmds);
         for (cmds) |cmd| switch (cmd) {
             .add => |url| {
                 defer w.freeCommand(cmd);
-                const id = insert(&shared, &run, url) catch |err| {
+                insert(&shared, &run, url) catch |err| {
                     w.post(.{ .fatal = .fmt("cannot add {s}: {t}", .{ url, err }) });
-                    continue;
                 };
-                launch(&shared, &downloads, id);
             },
-            .restart => |id| launch(&shared, &downloads, id),
-            .cancel => |id| for (downloads.items) |d| {
-                if (d.id == id) d.cancel.store(true, .release);
+            .restart => |id| enqueue(&shared, &run, id) catch |err| {
+                w.post(.{ .failed = .{ .id = id, .text = .fmt("cannot queue: {t}", .{err}) } });
+            },
+            .cancel => |id| {
+                // The row says cancelled either way; a job that has not
+                // been claimed yet reads that and does nothing. A running
+                // one is told, and reports itself when it has stopped.
+                store.setState(&db, &run, id, .cancelled, null) catch {};
+                run.reset();
+                if (!shared.cancelActive(id)) w.post(.{ .cancelled = .{ .id = id } });
             },
             .quit => {
-                quitting = true;
-                // Stopped, not cancelled: the row stays `running`, so the
-                // next start picks it up where it was.
-                for (downloads.items) |d| d.stop.store(true, .release);
+                // The workers are cancelled mid-run: each task writes its
+                // progress down on the way out and hands its row back to
+                // the queue, so the next start picks it up.
+                serving.cancel(io) catch {};
+                return;
             },
         };
-
-        // Reap what has finished. The task sets `finished` last, so the
-        // await here never waits.
-        var i: usize = 0;
-        while (i < downloads.items.len) {
-            const d = downloads.items[i];
-            if (d.finished.load(.acquire)) {
-                d.future.?.await(io);
-                d.destroy();
-                _ = downloads.swapRemove(i);
-            } else i += 1;
-        }
-
-        if (quitting and downloads.items.len == 0) return;
         Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch return;
     }
 }
 
-/// Report every row, and start the ones that were not finished.
-fn restore(s: *Shared, run: *store.Run, downloads: *std.ArrayList(*Download)) void {
+/// Report every row, and queue the ones that were not finished.
+fn restore(s: *Shared, run: *store.Run) void {
     defer run.reset();
+    _ = store.releaseStale(s.db, run) catch |err| {
+        s.worker.post(.{ .fatal = .fmt("cannot reset the queue: {t}", .{err}) });
+    };
     const rows = store.all(s.db, run) catch |err| {
         s.worker.post(.{ .fatal = .fmt("cannot read the list: {t}", .{err}) });
         return;
@@ -285,21 +366,24 @@ fn restore(s: *Shared, run: *store.Run, downloads: *std.ArrayList(*Download)) vo
         if (store.segmentsOf(s.db, run, row.id)) |segs| {
             for (segs) |seg| bytes += @intCast(seg.done);
         } else |_| {}
+        const unfinished = row.state == .queued or row.state == .running;
         s.worker.post(.{ .added = .{
             .id = row.id,
             .url = .from(row.url),
             .name = .from(row.name),
-            .state = row.state,
+            .state = if (unfinished) .queued else row.state,
             .total = if (row.total) |t| @intCast(t) else null,
             .bytes = bytes,
             .segments = @intCast(@min(row.segments, 255)),
         } });
-        if (row.state == .queued or row.state == .running) launch(s, downloads, row.id);
+        if (unfinished) enqueue(s, run, row.id) catch |err| {
+            s.worker.post(.{ .failed = .{ .id = row.id, .text = .fmt("cannot queue: {t}", .{err}) } });
+        };
     }
 }
 
-/// A new row for a URL, written down before anything is fetched.
-fn insert(s: *Shared, run: *store.Run, url: []const u8) !i64 {
+/// A new row for a URL, written down and queued before anything is fetched.
+fn insert(s: *Shared, run: *store.Run, url: []const u8) !void {
     defer run.reset();
     const name = nameFromUrl(url);
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -315,27 +399,18 @@ fn insert(s: *Shared, run: *store.Run, url: []const u8) !i64 {
         .bytes = 0,
         .segments = 0,
     } });
-    return row.id;
+    try enqueue(s, run, row.id);
 }
 
-fn launch(s: *Shared, downloads: *std.ArrayList(*Download), id: i64) void {
-    // One task per row at a time: a restart of something still running is
-    // a no-op rather than a second writer on the same file.
-    for (downloads.items) |d| if (d.id == id) return;
-    const gpa = s.worker.gpa;
-    const d = gpa.create(Download) catch return;
-    d.* = .{ .shared = s, .id = id };
-    d.future = s.io.concurrent(Download.run, .{d}) catch {
-        gpa.destroy(d);
-        s.worker.post(.{ .failed = .{ .id = id, .text = .from("no thread for it") } });
-        return;
-    };
-    downloads.append(gpa, d) catch {
-        d.cancel.store(true, .release);
-        d.future.?.await(s.io);
-        gpa.destroy(d);
-        s.worker.post(.{ .failed = .{ .id = id, .text = .from("out of memory") } });
-    };
+/// One job per row: the key makes a second push while the first is queued
+/// or running a no-op rather than a second writer on the same file.
+fn enqueue(s: *Shared, run: *store.Run, id: i64) !void {
+    defer run.reset();
+    var key: [32]u8 = undefined;
+    const unique = try std.fmt.bufPrint(&key, "dl:{d}", .{id});
+    try store.setState(s.db, run, id, .queued, null);
+    _ = try s.jobs.push(run, Fetch{ .download_id = id }, .{ .unique = unique });
+    s.worker.post(.{ .queued = .{ .id = id } });
 }
 
 // --------------------------------------------------------------- download
@@ -345,39 +420,47 @@ const Download = struct {
     id: i64,
     /// The person said stop: the row becomes `cancelled` and waits for `r`.
     cancel: std.atomic.Value(bool) = .init(false),
-    /// The process is leaving: the row stays `running` and resumes next time.
-    stop: std.atomic.Value(bool) = .init(false),
-    finished: std.atomic.Value(bool) = .init(false),
-    future: ?Io.Future(void) = null,
     /// A reason better than the error's name, when the code that failed
-    /// had one — an HTTP status, say. Read once, by `run`.
+    /// had one — an HTTP status, say. Read once, by `runJob`.
     why: ?Text = null,
 
-    fn destroy(d: *Download) void {
-        d.shared.worker.gpa.destroy(d);
-    }
-
-    fn run(d: *Download) void {
-        defer d.finished.store(true, .release);
-        const gpa = d.shared.worker.gpa;
-        var scope: store.Run = .initIo(gpa, d.shared.io);
+    /// What `Fetch.run` is. The verdict goes two places: the `downloads`
+    /// row, for the list, and the return value, for the queue — which
+    /// retries an error, buries a `final` one, and hands a `Canceled` row
+    /// back so the next start takes it.
+    fn runJob(shared: *Shared, id: i64) !void {
+        const gpa = shared.worker.gpa;
+        var scope: store.Run = .initIo(gpa, shared.io);
         defer scope.deinit();
+
+        // A row cancelled while the job waited its turn: nothing to do.
+        const row = (try shared.db.find(store.Download, &scope, id)) orelse return;
+        const skip = row.state == .cancelled or row.state == .done;
+        scope.reset();
+        if (skip) return;
+
+        var d: Download = .{ .shared = shared, .id = id };
+        try shared.register(&d);
+        defer shared.unregister(&d);
 
         d.runInner(&scope) catch |err| {
             scope.reset();
-            if (err == error.Stopped) {
-                // Progress is written; the state is left as it was.
-            } else if (err == error.Cancelled) {
-                store.setState(d.shared.db, &scope, d.id, .cancelled, null) catch {};
-                d.shared.worker.post(.{ .cancelled = .{ .id = d.id } });
-            } else {
-                const why = d.why orelse Text.fmt("{t}", .{err});
-                store.setState(d.shared.db, &scope, d.id, .failed, why.slice()) catch {};
-                d.shared.worker.post(.{ .failed = .{ .id = d.id, .text = why } });
+            if (err == error.Canceled) {
+                // The process is leaving. Progress is written; the row
+                // stays `running` here and goes back to `queued` there.
+                return err;
             }
+            if (err == error.Cancelled) {
+                store.setState(shared.db, &scope, id, .cancelled, null) catch {};
+                shared.worker.post(.{ .cancelled = .{ .id = id } });
+                return;
+            }
+            const why = d.why orelse Text.fmt("{t}", .{err});
+            store.setState(shared.db, &scope, id, .failed, why.slice()) catch {};
+            shared.worker.post(.{ .failed = .{ .id = id, .text = why } });
+            return err;
         };
     }
-
     fn runInner(d: *Download, scope: *store.Run) !void {
         const s = d.shared;
         const gpa = s.worker.gpa;
@@ -502,7 +585,6 @@ const Download = struct {
             var pending: usize = 0;
             var bytes: u64 = 0;
 
-            if (d.stop.load(.acquire)) return error.Stopped;
             if (d.cancel.load(.acquire)) return error.Cancelled;
 
             for (segments) |*seg| {
