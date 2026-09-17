@@ -1,16 +1,34 @@
 # fdm — fast download manager
 
 A download manager for Linux on [nilo](../nilo) and the
-[Native SDK](https://native-sdk.dev/). **This is the headless spike**: no
-window and no TUI yet, one binary that downloads one URL and reports what
-it learned. The window comes after, on top of the same worker.
+[Native SDK](https://native-sdk.dev/). **MVP 1 is a terminal front over a
+worker**; the window comes next, over the same worker.
 
 ```
 zig build
-./zig-out/bin/fdm <url> [-o file] [-n segments] [--stall ms] [--retries n]
+./zig-out/bin/fdm [url ...] [-n segments] [--stall ms] [--retries n]
 ```
 
-## The question the spike asks
+`a` adds a URL, `c` cancels the selected one, `r` retries a failed or
+cancelled one, `j`/`k` move, `q` quits. Files land in the current
+directory under the URL's last path segment.
+
+## Layout
+
+| File | What |
+|---|---|
+| `src/download.zig` | the worker: its own thread and `std.Io.Threaded`, one `fetch.Client`, every download a task with its segments under it. Talks to the rest through `Command` in and `Event` out, and knows nothing about a terminal or a window |
+| `src/tui.zig` | the terminal front: `Item` is the model, `Model.apply` is `update`, `draw` is the view. Raw mode and a `poll` on stdin, no curses |
+| `src/main.zig` | wiring |
+
+The seam between the two files is the point. A Native SDK app is
+Elm-shaped and does its background work on a thread the app owns, which
+posts through `fx.openChannel` and receives `Msg`s in `update` (their
+`examples/channel-monitor`). `tui.zig` is that same loop with a terminal
+on the end, and `download.zig` does not change when the terminal is
+swapped for a window.
+
+## The question the spike asked
 
 A Native SDK app is Elm-shaped: `Model`, `Msg`, `update`, and background
 work on a thread the app owns, which makes its own `std.Io.Threaded` and
@@ -30,6 +48,13 @@ Against a local server that honours `Range` (`rangesrv.py`, 20 MB of
 | 4 segments, `Range` honoured | complete, hash matches, 4 attempts |
 | Server ignores `Range` (answers 200) | probe sees it, falls back to one stream, hash matches |
 | One segment stalls mid-body, socket held open, `--stall 3000` | watchdog fires at 3,003 ms, `Future.cancel` returns in **0 ms** with `ReadFailed`, segment resumes from its last written byte, hash matches, 5 attempts |
+
+Driven through a pty (`drive_tui*.py` in the session, not checked in):
+two URLs at once, a third typed in with `a`, `c` on one mid-flight, a
+404 shown as `HTTP 404 Not Found`, a stall on the slowed server shown as
+its note and retried, `q` with downloads still running — every exit
+clean, no leaks under the Debug allocator, hashes of what finished
+matching.
 
 And once against the internet — `https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz`,
 55,478,392 bytes, 8 segments over TLS: complete, sha256 matches the one

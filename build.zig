@@ -1,5 +1,5 @@
-//! fdm — fast download manager. This is the headless spike: no window, no
-//! TUI, one binary that downloads one URL and prints what it learned.
+//! fdm — fast download manager: a worker on nilo_fetch, and a terminal
+//! front over it until the Native SDK window replaces it.
 
 const std = @import("std");
 
@@ -27,5 +27,8 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
     if (b.args) |args| run.addArgs(args);
-    b.step("run", "Download one URL: zig build run -- <url> [-o file] [-n segments]").dependOn(&run.step);
+    b.step("run", "fdm [url ...]: zig build run -- <url>").dependOn(&run.step);
+
+    const tests = b.addTest(.{ .root_module = exe.root_module });
+    b.step("test", "the unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
