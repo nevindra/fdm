@@ -1,0 +1,12 @@
+.{
+    .name = .fdm,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x8189ddc657527c5e,
+    .dependencies = .{
+        // By path for now: the spike measures the working copy of nilo next
+        // door rather than a published tag.
+        .nilo = .{ .path = "../nilo" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
