@@ -14,13 +14,13 @@ const posix = std.posix;
 const Text = download.Text;
 
 pub const Item = struct {
-    id: u32,
+    id: i64,
     url: Text,
     name: Text,
     total: ?u64 = null,
     bytes: u64 = 0,
     segments: u8 = 0,
-    state: enum { queued, running, done, failed, cancelled } = .queued,
+    state: download.State = .queued,
     note: Text = .{},
     elapsed_ms: i64 = 0,
     // For the rate: what was seen a moment ago, and when.
@@ -33,9 +33,9 @@ pub const Model = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Item) = .empty,
     selected: usize = 0,
-    next_id: u32 = 1,
     /// The URL being typed after `a`, or null when nothing is.
     input: ?std.ArrayList(u8) = null,
+    /// What the worker last said that was about nobody in particular.
     status: Text = .{},
 
     pub fn deinit(m: *Model) void {
@@ -43,7 +43,7 @@ pub const Model = struct {
         if (m.input) |*in| in.deinit(m.gpa);
     }
 
-    pub fn find(m: *Model, id: u32) ?*Item {
+    pub fn find(m: *Model, id: i64) ?*Item {
         for (m.items.items) |*it| if (it.id == id) return it;
         return null;
     }
@@ -51,12 +51,28 @@ pub const Model = struct {
     /// `update`: one event into the model.
     pub fn apply(m: *Model, ev: download.Event, now_ms: i64) void {
         switch (ev) {
+            .added => |a| {
+                // The worker owns the list; a row it reports twice is one row.
+                if (m.find(a.id) != null) return;
+                m.items.append(m.gpa, .{
+                    .id = a.id,
+                    .url = a.url,
+                    .name = a.name,
+                    .state = a.state,
+                    .total = a.total,
+                    .bytes = a.bytes,
+                    .segments = a.segments,
+                }) catch return;
+                if (a.state == .queued) m.selected = m.items.items.len - 1;
+            },
             .started => |s| if (m.find(s.id)) |it| {
                 it.name = s.name;
                 it.total = s.total;
                 it.segments = s.segments;
                 it.state = .running;
+                it.note = if (s.resumed) .from("resumed") else .{};
                 it.rate_ms = now_ms;
+                it.rate_bytes = it.bytes;
             },
             .progress => |p| if (m.find(p.id)) |it| {
                 it.bytes = p.bytes;
@@ -86,6 +102,7 @@ pub const Model = struct {
                 it.state = .cancelled;
                 it.rate = 0;
             },
+            .fatal => |t| m.status = t,
         }
     }
 };
@@ -133,16 +150,16 @@ pub fn run(gpa: std.mem.Allocator, worker: *download.Worker, urls: []const []con
     }
 }
 
+/// Hand a URL to the worker. The item appears when the worker reports the
+/// row it made for it.
 fn add(m: *Model, worker: *download.Worker, url: []const u8) !void {
+    _ = m;
     const trimmed = std.mem.trim(u8, url, " \t\r\n");
     if (trimmed.len == 0) return;
-    const id = m.next_id;
-    m.next_id += 1;
-    try m.items.append(m.gpa, .{ .id = id, .url = .from(trimmed), .name = .from(download.nameFromUrl(trimmed)) });
     // The worker frees this.
     const owned = try worker.gpa.dupe(u8, trimmed);
     errdefer worker.gpa.free(owned);
-    try worker.send(.{ .add = .{ .id = id, .url = owned, .out = null } });
+    try worker.send(.{ .add = owned });
 }
 
 /// One key (or escape sequence) into the model. Returns how many bytes it
@@ -158,7 +175,6 @@ fn handleKey(m: *Model, worker: *download.Worker, keys: []const u8) !?usize {
                 in.deinit(m.gpa);
                 m.input = null;
                 try add(m, worker, url);
-                m.selected = m.items.items.len -| 1;
             },
             0x1b => {
                 in.deinit(m.gpa);
@@ -184,7 +200,7 @@ fn handleKey(m: *Model, worker: *download.Worker, keys: []const u8) !?usize {
         },
         'r' => if (m.items.items.len > 0) {
             const it = m.items.items[m.selected];
-            if (it.state == .failed or it.state == .cancelled) try add(m, worker, it.url.slice());
+            if (it.state == .failed or it.state == .cancelled) try worker.send(.{ .restart = it.id });
         },
         0x1b => {
             // Arrow keys arrive as ESC [ A / ESC [ B.
@@ -212,7 +228,7 @@ fn draw(m: *Model, w: *std.Io.Writer, size: posix.winsize) !void {
     const rows: usize = @max(size.row, 6);
 
     try w.writeAll("\x1b[H"); // home
-    try line(w, cols, "fdm  —  [a]dd  [c]ancel  [r]etry  [j/k] move  [q]uit", .{});
+    try line(w, cols, "fdm  —  [a]dd  [c]ancel  [r]esume  [j/k] move  [q]uit", .{});
     try w.writeAll("\r\n");
 
     // Every download gets two lines: what and how far, then its note.
@@ -233,6 +249,8 @@ fn draw(m: *Model, w: *std.Io.Writer, size: posix.winsize) !void {
 
     if (m.input) |in| {
         try line(w, cols, "add url: {s}_", .{in.items});
+    } else if (m.status.len > 0) {
+        try line(w, cols, "{s}", .{m.status.slice()});
     } else {
         var running: usize = 0;
         var rate: f64 = 0;

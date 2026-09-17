@@ -8,6 +8,15 @@
 //! redraws. Both are ~50 lines over this file, and neither reaches into it:
 //! nothing here knows what a terminal or a window is.
 //!
+//! **The database is the list.** Every download is a row in `store.zig`'s
+//! SQLite file before it is anything else, its id is the row's, and the
+//! segments' progress is written there once a second and on every way out.
+//! So a restart shows the same list, and a download that was running when
+//! the process died resumes from the last byte each segment had written —
+//! after asking the server again and checking that its `ETag` and length
+//! are what they were, because a file that changed underneath a resume is
+//! a corrupt download that looks complete.
+//!
 //! What the spike settled, and this file keeps
 //! ([README](../README.md#what-was-found)):
 //!
@@ -21,8 +30,11 @@
 
 const std = @import("std");
 const fetch = @import("nilo_fetch");
+const store = @import("store.zig");
 
 const Io = std.Io;
+
+pub const State = store.State;
 
 /// Text that travels in an event without an owner: copied in, fixed size,
 /// truncated if it must be. A URL or a message, never a body.
@@ -30,7 +42,7 @@ pub const Text = struct {
     buf: [max]u8 = undefined,
     len: usize = 0,
 
-    pub const max = 256;
+    pub const max = 512;
 
     pub fn from(s: []const u8) Text {
         var t: Text = .{};
@@ -61,25 +73,31 @@ pub const Settings = struct {
     min_segment: u64 = 1 << 20,
 };
 
-/// What the UI asks for. `add` hands over its strings: they are allocated
-/// with the worker's allocator by the caller and freed by the worker when
-/// the download is gone.
+/// What the UI asks for. `add` hands over its string: allocated with the
+/// worker's allocator by the caller and freed by the worker.
 pub const Command = union(enum) {
-    add: struct { id: u32, url: []const u8, out: ?[]const u8 },
-    cancel: u32,
+    add: []const u8,
+    cancel: i64,
+    /// Run a failed or cancelled download again — from where it got to, if
+    /// the server still has the same file.
+    restart: i64,
     quit,
 };
 
-/// What the worker reports. One `started` per download, `progress` while
-/// it moves, `note` for anything a person would want to see, and exactly
-/// one of `done` / `failed` / `cancelled` at the end.
+/// What the worker reports. One `added` per row — on `add`, and for every
+/// row in the database when the worker starts — then `started`, `progress`
+/// while it moves, `note` for anything a person would want to see, and
+/// exactly one of `done` / `failed` / `cancelled` at the end of each run.
 pub const Event = union(enum) {
-    started: struct { id: u32, name: Text, total: ?u64, segments: u8 },
-    progress: struct { id: u32, bytes: u64 },
-    note: struct { id: u32, text: Text },
-    done: struct { id: u32, bytes: u64, elapsed_ms: i64 },
-    failed: struct { id: u32, text: Text },
-    cancelled: struct { id: u32 },
+    added: struct { id: i64, url: Text, name: Text, state: State, total: ?u64, bytes: u64, segments: u8 },
+    started: struct { id: i64, name: Text, total: ?u64, segments: u8, resumed: bool },
+    progress: struct { id: i64, bytes: u64 },
+    note: struct { id: i64, text: Text },
+    done: struct { id: i64, bytes: u64, elapsed_ms: i64 },
+    failed: struct { id: i64, text: Text },
+    cancelled: struct { id: i64 },
+    /// The worker cannot run at all — the database would not open.
+    fatal: Text,
 };
 
 /// A lock that needs no `Io`. Zig 0.16's `std.Io.Mutex.lock` takes one and
@@ -101,6 +119,7 @@ const Lock = struct {
 pub const Worker = struct {
     gpa: std.mem.Allocator,
     settings: Settings,
+    db_path: []const u8,
     mutex: Lock = .{},
     commands: std.ArrayList(Command) = .empty,
     events: std.ArrayList(Event) = .empty,
@@ -108,14 +127,17 @@ pub const Worker = struct {
 
     /// `gpa` has to be thread-safe: the UI allocates command strings with
     /// it and the worker frees them.
-    pub fn start(gpa: std.mem.Allocator, settings: Settings) !*Worker {
+    pub fn start(gpa: std.mem.Allocator, settings: Settings, db_path: []const u8) !*Worker {
         const w = try gpa.create(Worker);
-        w.* = .{ .gpa = gpa, .settings = settings };
+        errdefer gpa.destroy(w);
+        w.* = .{ .gpa = gpa, .settings = settings, .db_path = try gpa.dupe(u8, db_path) };
+        errdefer gpa.free(w.db_path);
         w.thread = try std.Thread.spawn(.{}, threadMain, .{w});
         return w;
     }
 
-    /// Ask the worker to finish — every download is cancelled — and wait.
+    /// Ask the worker to finish — every download is cancelled, and its
+    /// progress written down — and wait.
     pub fn stop(w: *Worker) void {
         w.send(.quit) catch {};
         w.thread.join();
@@ -123,6 +145,7 @@ pub const Worker = struct {
         w.commands.deinit(w.gpa);
         w.events.deinit(w.gpa);
         const gpa = w.gpa;
+        gpa.free(w.db_path);
         gpa.destroy(w);
     }
 
@@ -154,16 +177,22 @@ pub const Worker = struct {
 
     fn freeCommand(w: *Worker, c: Command) void {
         switch (c) {
-            .add => |a| {
-                w.gpa.free(a.url);
-                if (a.out) |o| w.gpa.free(o);
-            },
+            .add => |url| w.gpa.free(url),
             else => {},
         }
     }
 };
 
 // ----------------------------------------------------------------- thread
+
+/// Everything a download task needs that is shared: the worker, the client,
+/// the database, the Io. One of these for the life of the thread.
+const Shared = struct {
+    worker: *Worker,
+    client: *fetch.Client,
+    db: *store.Db,
+    io: Io,
+};
 
 fn threadMain(w: *Worker) void {
     const gpa = w.gpa;
@@ -173,10 +202,16 @@ fn threadMain(w: *Worker) void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    var db = store.open(gpa, io, w.db_path) catch |err| {
+        w.post(.{ .fatal = .fmt("cannot open {s}: {t}", .{ w.db_path, err }) });
+        return;
+    };
+    defer db.deinit();
+
     var client: fetch.Client = .init(gpa, .{
         .max_in_flight = 32,
         // The deadline cannot fire without an Engine, so zero is honest; the
-        // stall watchdog in `Download.run` is the bound instead.
+        // stall watchdog in `Download.supervise` is the bound instead.
         .timeout_ms = 0,
         // A refused body is dropped rather than drained: the probe leaves a
         // whole file unread when the server ignores its Range.
@@ -185,39 +220,39 @@ fn threadMain(w: *Worker) void {
     defer client.deinit();
     client.nilo_start(io, .off) catch return;
 
+    var shared: Shared = .{ .worker = w, .client = &client, .db = &db, .io = io };
+    var run: store.Run = .initIo(gpa, io);
+    defer run.deinit();
+
     var downloads: std.ArrayList(*Download) = .empty;
     defer downloads.deinit(gpa);
-    var quitting = false;
 
+    // The list is whatever the database has. Anything that was on its way
+    // when the process last stopped goes again.
+    restore(&shared, &run, &downloads);
+
+    var quitting = false;
     while (true) {
         const cmds = w.takeCommands();
         defer gpa.free(cmds);
         for (cmds) |cmd| switch (cmd) {
-            .add => |a| {
-                const d = Download.create(gpa, w, &client, io, a.id, a.url, a.out) catch {
-                    w.freeCommand(cmd);
-                    w.post(.{ .failed = .{ .id = a.id, .text = .from("out of memory") } });
+            .add => |url| {
+                defer w.freeCommand(cmd);
+                const id = insert(&shared, &run, url) catch |err| {
+                    w.post(.{ .fatal = .fmt("cannot add {s}: {t}", .{ url, err }) });
                     continue;
                 };
-                d.future = io.concurrent(Download.run, .{d}) catch {
-                    d.destroy();
-                    w.post(.{ .failed = .{ .id = a.id, .text = .from("no thread for it") } });
-                    continue;
-                };
-                downloads.append(gpa, d) catch {
-                    d.cancel.store(true, .release);
-                    d.future.?.await(io);
-                    d.destroy();
-                    w.post(.{ .failed = .{ .id = a.id, .text = .from("out of memory") } });
-                    continue;
-                };
+                launch(&shared, &downloads, id);
             },
+            .restart => |id| launch(&shared, &downloads, id),
             .cancel => |id| for (downloads.items) |d| {
                 if (d.id == id) d.cancel.store(true, .release);
             },
             .quit => {
                 quitting = true;
-                for (downloads.items) |d| d.cancel.store(true, .release);
+                // Stopped, not cancelled: the row stays `running`, so the
+                // next start picks it up where it was.
+                for (downloads.items) |d| d.stop.store(true, .release);
             },
         };
 
@@ -238,98 +273,218 @@ fn threadMain(w: *Worker) void {
     }
 }
 
+/// Report every row, and start the ones that were not finished.
+fn restore(s: *Shared, run: *store.Run, downloads: *std.ArrayList(*Download)) void {
+    defer run.reset();
+    const rows = store.all(s.db, run) catch |err| {
+        s.worker.post(.{ .fatal = .fmt("cannot read the list: {t}", .{err}) });
+        return;
+    };
+    for (rows) |row| {
+        var bytes: u64 = 0;
+        if (store.segmentsOf(s.db, run, row.id)) |segs| {
+            for (segs) |seg| bytes += @intCast(seg.done);
+        } else |_| {}
+        s.worker.post(.{ .added = .{
+            .id = row.id,
+            .url = .from(row.url),
+            .name = .from(row.name),
+            .state = row.state,
+            .total = if (row.total) |t| @intCast(t) else null,
+            .bytes = bytes,
+            .segments = @intCast(@min(row.segments, 255)),
+        } });
+        if (row.state == .queued or row.state == .running) launch(s, downloads, row.id);
+    }
+}
+
+/// A new row for a URL, written down before anything is fetched.
+fn insert(s: *Shared, run: *store.Run, url: []const u8) !i64 {
+    defer run.reset();
+    const name = nameFromUrl(url);
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(s.io, &cwd_buf);
+    const path = try std.fs.path.join(run.arena(), &.{ cwd_buf[0..cwd_len], name });
+    const row = try store.add(s.db, run, url, name, path, nowMs(s.io));
+    s.worker.post(.{ .added = .{
+        .id = row.id,
+        .url = .from(url),
+        .name = .from(name),
+        .state = .queued,
+        .total = null,
+        .bytes = 0,
+        .segments = 0,
+    } });
+    return row.id;
+}
+
+fn launch(s: *Shared, downloads: *std.ArrayList(*Download), id: i64) void {
+    // One task per row at a time: a restart of something still running is
+    // a no-op rather than a second writer on the same file.
+    for (downloads.items) |d| if (d.id == id) return;
+    const gpa = s.worker.gpa;
+    const d = gpa.create(Download) catch return;
+    d.* = .{ .shared = s, .id = id };
+    d.future = s.io.concurrent(Download.run, .{d}) catch {
+        gpa.destroy(d);
+        s.worker.post(.{ .failed = .{ .id = id, .text = .from("no thread for it") } });
+        return;
+    };
+    downloads.append(gpa, d) catch {
+        d.cancel.store(true, .release);
+        d.future.?.await(s.io);
+        gpa.destroy(d);
+        s.worker.post(.{ .failed = .{ .id = id, .text = .from("out of memory") } });
+    };
+}
+
 // --------------------------------------------------------------- download
 
 const Download = struct {
-    gpa: std.mem.Allocator,
-    worker: *Worker,
-    client: *fetch.Client,
-    io: Io,
-    id: u32,
-    url: []const u8,
-    out: ?[]const u8,
+    shared: *Shared,
+    id: i64,
+    /// The person said stop: the row becomes `cancelled` and waits for `r`.
     cancel: std.atomic.Value(bool) = .init(false),
+    /// The process is leaving: the row stays `running` and resumes next time.
+    stop: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
     future: ?Io.Future(void) = null,
     /// A reason better than the error's name, when the code that failed
     /// had one — an HTTP status, say. Read once, by `run`.
     why: ?Text = null,
 
-    fn create(gpa: std.mem.Allocator, w: *Worker, client: *fetch.Client, io: Io, id: u32, url: []const u8, out: ?[]const u8) !*Download {
-        const d = try gpa.create(Download);
-        d.* = .{ .gpa = gpa, .worker = w, .client = client, .io = io, .id = id, .url = url, .out = out };
-        return d;
-    }
-
     fn destroy(d: *Download) void {
-        const gpa = d.gpa;
-        gpa.free(d.url);
-        if (d.out) |o| gpa.free(o);
-        gpa.destroy(d);
+        d.shared.worker.gpa.destroy(d);
     }
 
     fn run(d: *Download) void {
         defer d.finished.store(true, .release);
-        d.runInner() catch |err| {
-            if (err == error.Cancelled) {
-                d.worker.post(.{ .cancelled = .{ .id = d.id } });
+        const gpa = d.shared.worker.gpa;
+        var scope: store.Run = .initIo(gpa, d.shared.io);
+        defer scope.deinit();
+
+        d.runInner(&scope) catch |err| {
+            scope.reset();
+            if (err == error.Stopped) {
+                // Progress is written; the state is left as it was.
+            } else if (err == error.Cancelled) {
+                store.setState(d.shared.db, &scope, d.id, .cancelled, null) catch {};
+                d.shared.worker.post(.{ .cancelled = .{ .id = d.id } });
             } else {
-                d.worker.post(.{ .failed = .{ .id = d.id, .text = d.why orelse .fmt("{t}", .{err}) } });
+                const why = d.why orelse Text.fmt("{t}", .{err});
+                store.setState(d.shared.db, &scope, d.id, .failed, why.slice()) catch {};
+                d.shared.worker.post(.{ .failed = .{ .id = d.id, .text = why } });
             }
         };
     }
 
-    fn runInner(d: *Download) !void {
-        const io = d.io;
-        const w = d.worker;
+    fn runInner(d: *Download, scope: *store.Run) !void {
+        const s = d.shared;
+        const gpa = s.worker.gpa;
+        const io = s.io;
+        const w = s.worker;
         const settings = w.settings;
 
-        const info = try probe(d);
-        const out_name = d.out orelse nameFromUrl(d.url);
+        // The row is the truth about this download; copy what the task
+        // needs, since the scope's arena is reset between statements.
+        const row = (try s.db.find(store.Download, scope, d.id)) orelse return error.Gone;
+        const url = try gpa.dupe(u8, row.url);
+        defer gpa.free(url);
+        const path = try gpa.dupe(u8, row.path);
+        defer gpa.free(path);
+        const name: Text = .from(row.name);
+        const stored_total = row.total;
+        const stored_etag: ?Text = if (row.etag) |e| .from(e) else null;
 
-        // Split only when the server can serve slices and the file is big
-        // enough for a slice to be worth its handshake.
-        const total = info.total;
-        const count: usize = if (info.ranged and total != null and total.? >= settings.min_segment * 2)
-            @intCast(@min(@as(u64, settings.segments), total.? / settings.min_segment))
-        else
-            1;
-        const ranged = info.ranged and count > 1;
+        const prior = try store.segmentsOf(s.db, scope, d.id);
+        var segments: std.ArrayList(Segment) = .empty;
+        defer segments.deinit(gpa);
+        for (prior) |p| try segments.append(gpa, .{
+            .row_id = p.id,
+            .index = @intCast(p.idx),
+            .start = @intCast(p.start),
+            .end = @intCast(p.stop),
+            .done = .init(@intCast(p.done)),
+            .saved = @intCast(p.done),
+        });
+        scope.reset();
 
-        w.post(.{ .started = .{ .id = d.id, .name = .from(out_name), .total = total, .segments = @intCast(count) } });
+        try store.setState(s.db, scope, d.id, .running, null);
+        scope.reset();
 
-        const file = try Io.Dir.cwd().createFile(io, out_name, .{ .truncate = true });
+        const info = try probe(d, url);
+
+        // Resume only when the server still has the same file and the one
+        // on disk is the size the plan expects; otherwise plan afresh.
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
         defer file.close(io);
-        if (total) |n| try file.setLength(io, n);
+        const on_disk = try file.length(io);
+        const same_object = optionalEql(stored_total, info.total) and
+            optionalTextEql(stored_etag, info.etag) and
+            (stored_etag != null or info.total != null);
+        const resumable = segments.items.len > 0 and same_object and info.ranged and
+            info.total != null and on_disk == info.total.?;
 
-        const segments = try d.gpa.alloc(Segment, count);
-        defer d.gpa.free(segments);
-        for (segments, 0..) |*s, i| {
-            const per = if (total) |n| n / count else std.math.maxInt(u64);
-            s.* = .{
-                .index = i,
-                .start = per * i,
-                .end = if (i + 1 == count) (total orelse std.math.maxInt(u64)) else per * (i + 1),
-            };
+        const total = info.total;
+        var ranged = false;
+        if (resumable) {
+            ranged = segments.items.len > 1;
+        } else {
+            // Split only when the server can serve slices and the file is
+            // big enough for a slice to be worth its handshake.
+            const count: usize = if (info.ranged and total != null and total.? >= settings.min_segment * 2)
+                @intCast(@min(@as(u64, settings.segments), total.? / settings.min_segment))
+            else
+                1;
+            ranged = info.ranged and count > 1;
+
+            var starts: [256]i64 = undefined;
+            var stops: [256]i64 = undefined;
+            for (0..count) |i| {
+                const per = if (total) |n| n / count else std.math.maxInt(u64);
+                starts[i] = @intCast(per * i);
+                stops[i] = @intCast(if (i + 1 == count) (total orelse std.math.maxInt(u64)) else per * (i + 1));
+            }
+            const rows = try store.plan(s.db, scope, d.id, if (total) |t| @intCast(t) else null, if (info.etag) |e| e.slice() else null, starts[0..count], stops[0..count]);
+            segments.clearRetainingCapacity();
+            for (rows) |p| try segments.append(gpa, .{
+                .row_id = p.id,
+                .index = @intCast(p.idx),
+                .start = @intCast(p.start),
+                .end = @intCast(p.stop),
+            });
+            scope.reset();
+            try file.setLength(io, total orelse 0);
         }
 
+        w.post(.{ .started = .{ .id = d.id, .name = name, .total = total, .segments = @intCast(segments.items.len), .resumed = resumable } });
+
         const started = nowMs(io);
-        try d.supervise(file, segments, ranged);
+        const outcome = d.supervise(scope, file, url, segments.items, ranged);
+        // Whatever happened, what each segment has is written down — this
+        // runs after `supervise`'s defer has stopped every task, so the
+        // numbers are final.
+        persist(d, scope, segments.items);
+        try outcome;
 
         var bytes: u64 = 0;
-        for (segments) |*s| bytes += s.done.load(.monotonic);
+        for (segments.items) |*seg| bytes += seg.done.load(.monotonic);
         if (total) |n| if (bytes != n) return error.ShortDownload;
+        try store.setState(s.db, scope, d.id, .done, null);
+        scope.reset();
         w.post(.{ .done = .{ .id = d.id, .bytes = bytes, .elapsed_ms = nowMs(io) - started } });
     }
 
     /// Starts every segment, restarts the ones that fail, and cancels the
     /// ones that stop moving — which is the one thing a deadline would do
     /// and, without an Engine, nothing else here does.
-    fn supervise(d: *Download, file: Io.File, segments: []Segment, ranged: bool) !void {
-        const io = d.io;
-        const w = d.worker;
+    fn supervise(d: *Download, scope: *store.Run, file: Io.File, url: []const u8, segments: []Segment, ranged: bool) !void {
+        const s = d.shared;
+        const io = s.io;
+        const w = s.worker;
         const settings = w.settings;
         var last_reported: u64 = std.math.maxInt(u64);
+        var last_saved_ms: i64 = nowMs(io);
 
         // **No task outlives this frame.** `segments` is freed by the
         // caller the moment this returns, and a segment task writes into
@@ -347,6 +502,7 @@ const Download = struct {
             var pending: usize = 0;
             var bytes: u64 = 0;
 
+            if (d.stop.load(.acquire)) return error.Stopped;
             if (d.cancel.load(.acquire)) return error.Cancelled;
 
             for (segments) |*seg| {
@@ -365,11 +521,16 @@ const Download = struct {
                             w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: attempt {d} failed: {t}", .{ seg.index, seg.attempts, seg.err }) } });
                         }
                         if (seg.attempts > settings.retries) return seg.err;
+                        // A segment restored with nothing left to do.
+                        if (seg.len()) |want| if (seg.done.load(.monotonic) >= want) {
+                            seg.state.store(.ok, .release);
+                            continue;
+                        };
                         seg.attempts += 1;
                         seg.last_seen = seg.done.load(.monotonic);
                         seg.last_moved_ms = now;
                         seg.state.store(.running, .release);
-                        seg.future = try io.concurrent(Segment.run, .{ seg, d.client, file, io, d.url, ranged });
+                        seg.future = try io.concurrent(Segment.run, .{ seg, s.client, file, io, url, ranged });
                         pending += 1;
                     },
                     .running => {
@@ -393,37 +554,71 @@ const Download = struct {
                 last_reported = bytes;
                 w.post(.{ .progress = .{ .id = d.id, .bytes = bytes } });
             }
+            if (now - last_saved_ms >= 1000) {
+                last_saved_ms = now;
+                persist(d, scope, segments);
+            }
             try Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake);
         }
     }
+
+    /// Write down what each segment has, for the ones that moved. A write
+    /// that fails is a note rather than a failed download: the bytes are
+    /// on disk either way, and the next save gets another chance.
+    fn persist(d: *Download, scope: *store.Run, segments: []Segment) void {
+        for (segments) |*seg| {
+            const done = seg.done.load(.monotonic);
+            if (done == seg.saved) continue;
+            store.saveDone(d.shared.db, scope, seg.row_id, @intCast(done)) catch |err| {
+                d.shared.worker.post(.{ .note = .{ .id = d.id, .text = .fmt("progress not saved: {t}", .{err}) } });
+                continue;
+            };
+            seg.saved = done;
+        }
+        scope.reset();
+    }
 };
+
+fn optionalEql(a: ?i64, b: ?u64) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == @as(i64, @intCast(b.?));
+}
+
+fn optionalTextEql(a: ?Text, b: ?Text) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?.slice(), b.?.slice());
+}
 
 // ------------------------------------------------------------------ probe
 
-const Probe = struct { total: ?u64, ranged: bool };
+const Probe = struct { total: ?u64, ranged: bool, etag: ?Text };
 
 /// One byte, asked for with a Range. A 206 says the server can slice and
 /// how big the whole is; a 200 says it cannot, and the body it started
-/// sending is dropped rather than drained.
-fn probe(d: *Download) !Probe {
+/// sending is dropped rather than drained. Either way the answer carries
+/// what identifies the object, for the next run to compare against.
+fn probe(d: *Download, url: []const u8) !Probe {
     var transfer: [4096]u8 = undefined;
     var redirect: [2048]u8 = undefined;
     var ex: fetch.Exchange = .idle;
     defer ex.end();
 
-    const head = try ex.begin(d.client, .{
+    const head = try ex.begin(d.shared.client, .{
         .method = .GET,
-        .url = d.url,
+        .url = url,
         .headers = &.{.{ .name = "range", .value = "bytes=0-0" }},
         .redirect_buffer = &redirect,
         .transfer_buffer = &transfer,
     });
+    const etag: ?Text = if (head.header("etag")) |e| .from(e) else if (head.header("last-modified")) |m| .from(m) else null;
     switch (head.status) {
         .partial_content => {
             const cr = head.header("content-range") orelse return error.NoContentRange;
-            return .{ .total = try totalFromContentRange(cr), .ranged = true };
+            return .{ .total = try totalFromContentRange(cr), .ranged = true, .etag = etag };
         },
-        .ok => return .{ .total = head.content_length, .ranged = false },
+        .ok => return .{ .total = head.content_length, .ranged = false, .etag = etag },
         else => {
             d.why = .fmt("HTTP {d} {s}", .{ @intFromEnum(head.status), head.status.phrase() orelse "" });
             return error.BadStatus;
@@ -442,6 +637,8 @@ fn totalFromContentRange(value: []const u8) !?u64 {
 // --------------------------------------------------------------- segments
 
 const Segment = struct {
+    /// Its row in `segments`, where `done` is written down.
+    row_id: i64,
     index: usize,
     start: u64,
     /// Exclusive. `maxInt` when the length is unknown, which is also the
@@ -450,16 +647,18 @@ const Segment = struct {
     /// Bytes that have reached the file, counted from `start`. The task
     /// stores; the supervisor reads.
     done: std.atomic.Value(u64) = .init(0),
+    /// What the database last heard.
+    saved: u64 = 0,
     /// `.running` until the task writes its verdict, which it does before
     /// returning so the supervisor can `await` without ever blocking.
-    state: std.atomic.Value(State) = .init(.idle),
+    state: std.atomic.Value(SegState) = .init(.idle),
     err: anyerror = error.None,
     attempts: u8 = 0,
     future: ?Io.Future(void) = null,
     last_seen: u64 = 0,
     last_moved_ms: i64 = 0,
 
-    const State = enum(u8) { idle, running, ok, failed };
+    const SegState = enum(u8) { idle, running, ok, failed };
 
     fn len(s: *const Segment) ?u64 {
         return if (s.end == std.math.maxInt(u64)) null else s.end - s.start;

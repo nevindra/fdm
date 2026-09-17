@@ -1,23 +1,33 @@
 # fdm — fast download manager
 
 A download manager for Linux on [nilo](../nilo) and the
-[Native SDK](https://native-sdk.dev/). **MVP 1 is a terminal front over a
-worker**; the window comes next, over the same worker.
+[Native SDK](https://native-sdk.dev/). **MVP 2 is a terminal front over a
+worker that remembers**; the window comes next, over the same worker.
 
 ```
 zig build
-./zig-out/bin/fdm [url ...] [-n segments] [--stall ms] [--retries n]
+./zig-out/bin/fdm [url ...] [-n segments] [--stall ms] [--retries n] [--db file]
 ```
 
-`a` adds a URL, `c` cancels the selected one, `r` retries a failed or
+`a` adds a URL, `c` cancels the selected one, `r` resumes a failed or
 cancelled one, `j`/`k` move, `q` quits. Files land in the current
 directory under the URL's last path segment.
+
+**The list survives.** Every download is a row in one SQLite file
+(`--db`, default `$XDG_DATA_HOME/fdm/fdm.db`) and each segment's progress
+is written there once a second and on every way out. Start `fdm` again
+and the same list is there; whatever was running when it stopped — `q`,
+a crash, `kill -9` — carries on from the last byte each segment had. Before
+it does, the server is asked again: a different `ETag` or length means a
+different file, and that starts over rather than stitching two files into
+one. `c` marks a row cancelled and keeps its bytes; `r` resumes it.
 
 ## Layout
 
 | File | What |
 |---|---|
 | `src/download.zig` | the worker: its own thread and `std.Io.Threaded`, one `fetch.Client`, every download a task with its segments under it. Talks to the rest through `Command` in and `Event` out, and knows nothing about a terminal or a window |
+| `src/store.zig` | the two tables as structs — `downloads` and `segments` — on `nilo_sql`'s SQLite wire with `.threading = .in_fiber`, and the six statements the worker makes against them. `createMissing` builds them on first open |
 | `src/tui.zig` | the terminal front: `Item` is the model, `Model.apply` is `update`, `draw` is the view. Raw mode and a `poll` on stdin, no curses |
 | `src/main.zig` | wiring |
 
@@ -55,6 +65,13 @@ two URLs at once, a third typed in with `a`, `c` on one mid-flight, a
 its note and retried, `q` with downloads still running — every exit
 clean, no leaks under the Debug allocator, hashes of what finished
 matching.
+
+And for the database, on the same server slowed to 1.3 MB/s: `q` at 29%
+then a restart resumes and finishes; `kill -9` at 40% resumes from the
+counters written a second earlier and finishes; the server's file
+replaced between runs (new `ETag`) starts over and finishes with the new
+file's hash; `c` at 8 MB then `r` resumes from 8 MB. Each end state
+matches sha256.
 
 And once against the internet — `https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz`,
 55,478,392 bytes, 8 segments over TLS: complete, sha256 matches the one
@@ -100,8 +117,11 @@ on an empty one.
   holds for a TLS connection (nilo measures 59,151 bytes). A manager with
   32 segments open is paying ~6 MB in buffers alone; sizing these is a
   decision, not a default.
-- **Persistence and a queue** are the next layer — `nilo_sql`'s SQLite
-  wire with `.threading = .in_fiber` and `nilo_job` both run on the same
-  Io, and neither is touched here yet.
-- **Resume across runs** needs `ETag`/`If-Range`; this spike resumes only
-  within one run.
+- **A queue with a limit on how many run at once** — `nilo_job` runs on
+  the same Io and is the obvious shape for it; today everything added
+  starts immediately.
+- **Delete** a row, with or without its file.
+- **On this machine `-fllvm` is forced** in `build.zig`: glibc 2.44's
+  `crt1.o` carries an `.sframe` section Zig 0.16's own ELF linker
+  refuses, and `-flld` alone crashes the compiler. Debug builds pay a few
+  seconds for it.
