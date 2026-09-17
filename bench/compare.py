@@ -28,8 +28,14 @@ ap.add_argument("--fixed", default="", help="per-tool seconds to subtract, measu
 args = ap.parse_args()
 fixed = {k: float(v) for k, v in (kv.split("=") for kv in args.fixed.split(",") if kv)}
 
+# A Debug fdm spends 0.6 s of CPU on TLS that ReleaseSafe spends 0.08 s on,
+# and one evening's tables were taken with it: say which binary this is.
+fdm_size = os.path.getsize(args.fdm)
+print(f"fdm: {args.fdm} ({fdm_size/1e6:.1f} MB){'  ** looks like a Debug build; zig build -Doptimize=ReleaseSafe **' if fdm_size > 18e6 else ''}", flush=True)
+
 def run_pty(argv, cwd):
-    """Wall seconds and exit code of argv run in a pty, output discarded."""
+    """Wall seconds, exit code, and the last 2 KB of output of argv run in a pty."""
+    tail = b""
     t0 = time.time()
     pid, fd = pty.fork()
     if pid == 0:
@@ -44,6 +50,7 @@ def run_pty(argv, cwd):
                 data = os.read(fd, 65536)
             except OSError:
                 break
+            tail = (tail + data)[-2048:]
             if b"\x1b[6n" in data: os.write(fd, b"\x1b[1;1R")
             if b"\x1b[5n" in data: os.write(fd, b"\x1b[0n")
         else:
@@ -53,7 +60,7 @@ def run_pty(argv, cwd):
         _, st = os.waitpid(pid, 0)
     except ChildProcessError:
         st = 0
-    return time.time() - t0, os.waitstatus_to_exitcode(st)
+    return time.time() - t0, os.waitstatus_to_exitcode(st), tail
 
 def tools(url, outdir):
     name = os.path.basename(urllib.parse.urlparse(url).path)
@@ -83,13 +90,16 @@ for url in args.urls:
         for n in order:
             clean(outdir)
             argv, fname = tools(url, outdir)[n]
-            secs, code = run_pty(argv, outdir)
+            secs, code, tail = run_pty(argv, outdir)
             path = os.path.join(outdir, fname)
             size = os.path.getsize(path) if os.path.exists(path) else 0
             ok = code == 0 and size > 0 and (expected is None or size == expected)
             if ok and expected is None: expected = size
             res[n].append((secs, size, ok))
             print(f"  {url.split('/')[2]:28} round {r+1} {n:8} {secs:7.2f}s  {size/1e6/secs:6.2f} MB/s  {'ok' if ok else 'FAILED code=%d size=%d' % (code, size)}", flush=True)
+            if not ok:
+                for line in tail.decode(errors="replace").splitlines()[-6:]:
+                    print("      | " + line.strip(), flush=True)
     results[url] = (res, expected)
     clean(outdir)
 

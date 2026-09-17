@@ -39,6 +39,7 @@ const std = @import("std");
 const fetch = @import("nilo_fetch");
 const job = @import("nilo_job");
 const store = @import("store.zig");
+const dns = @import("dns.zig");
 
 const Io = std.Io;
 
@@ -293,10 +294,12 @@ const Shared = struct {
 fn threadMain(w: *Worker) void {
     const gpa = w.gpa;
 
-    // The same Io a Native SDK worker thread makes for itself.
+    // The same Io a Native SDK worker thread makes for itself, with one
+    // vtable slot swapped so a host is resolved once a download rather
+    // than once a connection (`dns.zig` says why).
     var threaded: Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const io = threaded.io();
+    const io = dns.wrap(threaded.io());
 
     var db = store.open(gpa, io, w.db_path) catch |err| {
         w.post(.{ .fatal = .fmt("cannot open {s}: {t}", .{ w.db_path, err }) });
@@ -540,7 +543,24 @@ const Download = struct {
         try store.setState(s.db, scope, d.id, .running, null);
         scope.reset();
 
-        const info = try probe(d, url);
+        // The probe is the one request nothing else covers: a segment that
+        // cannot connect is tried again by the supervisor, so the probe gets
+        // the same allowance. Only for failures before an answer — a
+        // resolver that gave up, a connection refused — since an answer the
+        // server chose is `why` and does not improve by asking again.
+        var location_buf: [2048]u8 = undefined;
+        const info = blk: {
+            var attempt: u32 = 1;
+            while (true) : (attempt += 1) {
+                break :blk probe(d, url, &location_buf) catch |err| {
+                    if (d.why != null or err == error.Canceled or err == error.Cancelled) return err;
+                    if (attempt > settings.retries) return err;
+                    w.post(.{ .note = .{ .id = d.id, .text = .fmt("probe attempt {d} failed: {t}, retrying", .{ attempt, err }) } });
+                    try Io.sleep(io, Io.Duration.fromMilliseconds(1000), .awake);
+                    continue;
+                };
+            }
+        };
 
         // Resume only when the server still has the same file and the one
         // on disk is the size the plan expects; otherwise plan afresh.
@@ -584,7 +604,10 @@ const Download = struct {
         w.post(.{ .started = .{ .id = d.id, .name = name, .total = total, .segments = @intCast(segments.items.len), .resumed = resumable } });
 
         const started = nowMs(io);
-        const outcome = d.supervise(scope, file, url, &segments, ranged);
+        // The segments go where the probe ended up, not where it started.
+        const fetch_url = info.location orelse url;
+        if (info.location) |l| w.post(.{ .note = .{ .id = d.id, .text = .fmt("redirected to {s}", .{l}) } });
+        const outcome = d.supervise(scope, file, fetch_url, &segments, ranged);
         // Whatever happened, what each segment has is written down — this
         // runs after `supervise`'s defer has stopped every task, so the
         // numbers are final.
@@ -838,13 +861,24 @@ fn optionalTextEql(a: ?Text, b: ?Text) bool {
 
 // ------------------------------------------------------------------ probe
 
-const Probe = struct { total: ?u64, ranged: bool, etag: ?Text };
+const Probe = struct {
+    total: ?u64,
+    ranged: bool,
+    etag: ?Text,
+    /// Where the redirects ended, when they went anywhere. The segments
+    /// ask there directly: `mirrors.kernel.org` answers every request
+    /// with a 301 to its edge and lets about eight handshakes a second
+    /// through, so sixteen segments each following it themselves spent
+    /// five seconds arriving and left curl, which follows once, well
+    /// ahead. Points into the buffer the caller handed `probe`.
+    location: ?[]const u8,
+};
 
 /// One byte, asked for with a Range. A 206 says the server can slice and
 /// how big the whole is; a 200 says it cannot, and the body it started
 /// sending is dropped rather than drained. Either way the answer carries
 /// what identifies the object, for the next run to compare against.
-fn probe(d: *Download, url: []const u8) !Probe {
+fn probe(d: *Download, url: []const u8, location_buf: *[2048]u8) !Probe {
     var transfer: [4096]u8 = undefined;
     var redirect: [2048]u8 = undefined;
     var ex: fetch.Exchange = .idle;
@@ -858,12 +892,21 @@ fn probe(d: *Download, url: []const u8) !Probe {
         .transfer_buffer = &transfer,
     });
     const etag: ?Text = if (head.header("etag")) |e| .from(e) else if (head.header("last-modified")) |m| .from(m) else null;
+    // `std.http.Client` rewrites the request's URI as it follows each
+    // redirect, into `redirect` above — so it is copied out here, while
+    // that buffer is still alive.
+    const location: ?[]const u8 = blk: {
+        var w: Io.Writer = .fixed(location_buf);
+        ex.req.uri.format(&w) catch break :blk null;
+        const final = w.buffered();
+        break :blk if (std.mem.eql(u8, final, url)) null else final;
+    };
     switch (head.status) {
         .partial_content => {
             const cr = head.header("content-range") orelse return error.NoContentRange;
-            return .{ .total = try totalFromContentRange(cr), .ranged = true, .etag = etag };
+            return .{ .total = try totalFromContentRange(cr), .ranged = true, .etag = etag, .location = location };
         },
-        .ok => return .{ .total = head.content_length, .ranged = false, .etag = etag },
+        .ok => return .{ .total = head.content_length, .ranged = false, .etag = etag, .location = location },
         else => {
             d.why = .fmt("HTTP {d} {s}", .{ @intFromEnum(head.status), head.status.phrase() orelse "" });
             return error.BadStatus;
@@ -970,7 +1013,11 @@ const Segment = struct {
         var range_buf: [64]u8 = undefined;
 
         const from = seg.start + seg.have();
-        const range = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ from, seg.end.load(.acquire) -| 1 });
+        // Read once: a steal can move `end` between the request and its
+        // answer, and the answer is measured against what was asked. The
+        // read loop below follows the atomic and stops at the new boundary.
+        const asked_end = seg.end.load(.acquire);
+        const range = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ from, asked_end -| 1 });
         const headers: []const std.http.Header = if (ranged) &.{.{ .name = "range", .value = range }} else &.{};
 
         var ex: fetch.Exchange = .idle;
@@ -987,7 +1034,7 @@ const Segment = struct {
             // A 200 here is the whole file; writing it at `from` would
             // corrupt everything after it. Refuse before a byte lands.
             if (head.status != .partial_content) return error.RangeIgnored;
-            if (head.content_length) |n| if (n != seg.end.load(.acquire) - from) return error.LengthMismatch;
+            if (head.content_length) |n| if (n != asked_end - from) return error.LengthMismatch;
         } else if (head.status != .ok) return error.BadStatus;
 
         var fw = file.writer(io, &wbuf);

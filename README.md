@@ -45,6 +45,7 @@ the next start" is. `std.log` goes to `<db>.log`, never the terminal.
 | `src/download.zig` | the worker: its own thread and `std.Io.Threaded`, one `fetch.Client`, every download a task with its segments under it. Talks to the rest through `Command` in and `Event` out, and knows nothing about a terminal or a window |
 | `src/store.zig` | the tables as structs — `downloads`, `segments`, and `nilo_job`'s own `nilo_jobs` — on `nilo_sql`'s SQLite wire with `.threading = .in_fiber`, and the statements the worker makes against them. `createMissing` builds them on first open |
 | `src/tui.zig` | the terminal front on libvaxis: `Item` is the model, `Model.apply` is `update`, `draw` is the view. A tick thread posts into vaxis's queue ten times a second; that is when the worker's events are taken |
+| `src/dns.zig` | the worker's Io with one vtable slot swapped: a host is resolved once a download rather than once a connection |
 | `src/theme.zig` | every colour, in one place |
 | `src/main.zig` | wiring |
 
@@ -170,12 +171,36 @@ after the others were done; after, a steal at 3 s and a reconnect at 3 s
 finish the whole file in **6.2 s**, sha256 matching, and `kill -9` in the
 middle of it resumes from the five-row table.
 
+## Against curl and Surge
+
+[`bench/result.md`](bench/result.md) is the record: `bench/compare.py`
+runs curl, fdm with sixteen and with four segments, and Surge, interleaved,
+three rounds a host, and checks every file's size. The short version: on a
+host that gives one connection the whole pipe (cdn.kernel.org, nodejs.org,
+this link's 11 MB/s) fdm is curl to within a second and there is nothing
+to win; on a host that caps a connection (speedtest.tele2.net, 0.3 MB/s
+each) fdm-16 finishes 100 MB in 12–16 s against curl's 345 s and Surge's
+37 s. Surge carries a fixed nine seconds of start-up on this machine, which
+the tables show both with and without.
+
+**Three things the benchmark found were fdm's fault, and each is fixed.**
+`mirror.rackspace.com` failed three runs in three with nothing on disk: a
+router that answers `AAAA` queries for a name without one by not
+answering, so a lookup is five seconds or `EAI_AGAIN`, and fdm asked once
+per connection — sixteen, then one more per steal and per reconnect —
+where curl asks once. `src/dns.zig` answers the second and later from a
+table, and the probe, which is the one request nothing else retried,
+gets the same three attempts a segment does. `mirrors.kernel.org` took
+fdm-16 nearly three times as long as curl: it answers every request with a 301 to its
+edge and lets about eight handshakes a second through, and each segment
+followed it alone; the probe now carries the URL it ended on and the
+segments go there. And a steal that moved a segment's `end` between its
+request and the answer made the Content-Length check refuse a correct
+answer as `LengthMismatch`; the check now compares against the end that
+was asked for.
+
 ## What is still open
 
-- **Throughput against a fast peer** has not been measured: every run so
-  far was loopback (200 MB/s, disk-bound) or a slow link. The number that
-  matters — segments against one stream on a link that is actually the
-  bottleneck — is still to take, with `curl` beside it as the control.
 - **Stack per segment**: two 64 KiB buffers plus what `std.http.Client`
   holds for a TLS connection (nilo measures 59,151 bytes). A manager with
   32 segments open is paying ~6 MB in buffers alone; sizing these is a

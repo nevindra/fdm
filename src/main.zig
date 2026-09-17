@@ -165,4 +165,5 @@ test {
     _ = download;
     _ = tui;
     _ = @import("store.zig");
+    _ = @import("dns.zig");
 }
