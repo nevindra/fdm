@@ -139,3 +139,59 @@ segments go there. And a steal that moved a segment's `end` between its
 request and the answer made the Content-Length check refuse a correct
 answer as `LengthMismatch`; the check now compares against the end that
 was asked for.
+
+## Headers, a name from the server, and what `Add` had to become
+
+Five roadmap entries in one pass, each meant to be a column or a flag,
+and the thing they had in common was found first: `Command.add` carried
+a URL and nothing else, so a header, an `-o` and a "yes, again" had
+nowhere to travel. `Add` is now a struct the UI fills and the worker
+frees, and the five entries were fields on it plus what each field costs
+once it reaches the worker.
+
+**A `User-Agent` copied off a browser went out twice.** `std.http.Client`
+writes `host`, `authorization`, `content-type` and `user-agent` for
+itself unless overridden, and `nilo_fetch`'s `Begin` had a slot for the
+first three. A test server logging `get_all('user-agent')` saw
+`['zig/0.16.0 (std.http)', 'Mozilla/5.0']`. The worker routes
+`Authorization`, `Host` and `User-Agent` to their slots — the last one
+new in nilo for this — and drops `Connection`, `Accept-Encoding` and
+`Content-Length`, which are the client's to decide.
+
+**Where the name comes from is decided in order.** `-o file` is the
+person's and nothing renames it; `Content-Disposition` is taken once,
+before the file exists and only when no segment was ever planned, so a
+resume never moves a half-written file; the URL's last segment is what
+is left. A server does not get to choose the directory: a name with a
+separator in it, or `.`/`..`, is no name. `filename*=UTF-8''a%20b.bin`
+wins over `filename="x.bin"` as RFC 6266 says.
+
+**The duplicate is checked against the path the worker decided**, not
+the one the person typed, because `-o out/` and `--dir out` produce the
+same file from different words. The lookup is two `one` queries rather
+than an `OR`, and the URL is tried first because it is the one a person
+recognises in the prompt. Two URLs the server would name the same file
+are not caught — the name is not known until the probe.
+
+**`createMissing` creates a table that is not there and leaves one that
+is**, so a column added to a Row after the first release does nothing to
+a file made before it. `store.open` now reads `pragma_table_info` and
+runs one `ALTER TABLE` per missing column, with the type `createMissing`
+would have written; a test makes the first release's table by hand and
+opens it.
+
+**`--batch` split on newlines before it parsed**, so a pasted `curl`
+line with `\` continuations became five URLs, three of them
+`-H 'X-Token: letmein' \`. The reader now joins a line ending in `\`
+onto the next before `curl.parse` sees it.
+
+Driven against a local `ThreadingHTTPServer` that honours `Range`,
+answers 403 without `X-Token`, sends `Content-Disposition` and
+`Last-Modified: Tue, 15 Nov 1994`: the 403 without the flag and the
+download with it; `--dir` made on the way; `server name.bin` chosen over
+`download`; `-o mine.bin` kept over it; the mtime on disk 1994-11-15
+12:45:26 UTC; the duplicate refused with exit 1 and taken with
+`--force`; a `--batch` of a URL and a curl line with `--json` lines; the
+same in the TUI through tmux, the prompt answered `y`, a curl line pasted
+after `a`. Every hash matches.
+

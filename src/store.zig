@@ -43,6 +43,12 @@ pub const Download = struct {
     /// Why, when `state` is `failed`.
     reason: ?[]const u8,
     created_ms: i64,
+    /// `Name: value` lines, newline-separated, sent with every request
+    /// for this download. Null when there are none.
+    headers: ?[]const u8,
+    /// The person chose the file name, so the server's
+    /// `Content-Disposition` does not rename it.
+    named: bool,
 };
 
 pub const Segment = struct {
@@ -70,7 +76,32 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Db {
     var run: Run = .initIo(gpa, io);
     defer run.deinit();
     try sql.migrate.createMissing(&db, &run, &.{ Download, Segment, JobTable.Row });
+    try addMissingColumns(&db, &run);
     return db;
+}
+
+/// Columns that came after the first release, put onto a file made before
+/// them. `createMissing` creates a table that is not there and leaves one
+/// that is, so each of these is one `ALTER TABLE` when `pragma_table_info`
+/// does not list it. The types are the ones `createMissing` writes for the
+/// same fields, so a file made either way is the same file.
+fn addMissingColumns(db: *Db, run: *Run) !void {
+    const added = [_]struct { name: []const u8, sql: []const u8 }{
+        .{ .name = "headers", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"headers\" TEXT" },
+        .{ .name = "named", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"named\" INTEGER NOT NULL DEFAULT 0" },
+    };
+    const Col = struct {
+        pub const nilo_table = .projection;
+        name: []const u8,
+    };
+    const have = try db.raw(Col, run, "SELECT name FROM pragma_table_info('downloads')", .{});
+    for (added) |col| {
+        var found = false;
+        for (have) |h| if (std.mem.eql(u8, h.name, col.name)) {
+            found = true;
+        };
+        if (!found) _ = try db.exec(run, col.sql, .{});
+    }
 }
 
 /// **One process owns this file**, so a job row that is `running` when the
@@ -92,7 +123,7 @@ pub fn segmentsOf(db: *Db, run: *Run, id: i64) ![]Segment {
     return db.select(Segment, run, .{ .where = .{ .download_id = id }, .order = .{ .idx = .asc } });
 }
 
-pub fn add(db: *Db, run: *Run, url: []const u8, name: []const u8, path: []const u8, now_ms: i64) !Download {
+pub fn add(db: *Db, run: *Run, url: []const u8, name: []const u8, path: []const u8, headers: ?[]const u8, named: bool, now_ms: i64) !Download {
     return db.insert(Download, run, .{
         .url = url,
         .name = name,
@@ -103,6 +134,24 @@ pub fn add(db: *Db, run: *Run, url: []const u8, name: []const u8, path: []const 
         .state = .queued,
         .reason = null,
         .created_ms = now_ms,
+        .headers = headers,
+        .named = named,
+    });
+}
+
+/// A row that already has this URL, or failing that this path — whatever
+/// its state. Two lookups rather than an `OR`, and the URL wins because it
+/// is the one a person recognises.
+pub fn duplicate(db: *Db, run: *Run, url: []const u8, path: []const u8) !?Download {
+    if (try db.one(Download, run, .{ .where = .{ .url = url } })) |row| return row;
+    return db.one(Download, run, .{ .where = .{ .path = path } });
+}
+
+/// The server had a better name than the URL did.
+pub fn rename(db: *Db, run: *Run, id: i64, name: []const u8, path: []const u8) !void {
+    _ = try db.update(Download, run, .{
+        .set = .{ .name = name, .path = path },
+        .where = .{ .id = id },
     });
 }
 
@@ -181,8 +230,16 @@ test "the tables build, and a download round-trips with its segments" {
     var run: Run = .initIo(std.testing.allocator, io);
     defer run.deinit();
 
-    const d = try add(&db, &run, "https://x.y/a.bin", "a.bin", "/tmp/a.bin", 1);
+    const d = try add(&db, &run, "https://x.y/a.bin", "a.bin", "/tmp/a.bin", "Cookie: k=v", false, 1);
     try std.testing.expectEqual(State.queued, d.state);
+    try std.testing.expectEqualStrings("Cookie: k=v", d.headers.?);
+    try std.testing.expect(!d.named);
+
+    // The same URL, or the same path, is found; another is not.
+    try std.testing.expectEqual(d.id, (try duplicate(&db, &run, "https://x.y/a.bin", "/tmp/b.bin")).?.id);
+    try std.testing.expectEqual(d.id, (try duplicate(&db, &run, "https://x.y/b.bin", "/tmp/a.bin")).?.id);
+    try std.testing.expect((try duplicate(&db, &run, "https://x.y/b.bin", "/tmp/b.bin")) == null);
+    try rename(&db, &run, d.id, "real.bin", "/tmp/real.bin");
 
     const segs = try plan(&db, &run, d.id, 100, "\"abc\"", &.{ 0, 50 }, &.{ 50, 100 });
     try std.testing.expectEqual(@as(usize, 2), segs.len);
@@ -192,6 +249,7 @@ test "the tables build, and a download round-trips with its segments" {
     try std.testing.expectEqual(@as(i64, 7), back[1].done);
     const rows = try all(&db, &run);
     try std.testing.expectEqual(@as(?i64, 100), rows[0].total);
+    try std.testing.expectEqualStrings("real.bin", rows[0].name);
     try std.testing.expectEqualStrings("\"abc\"", rows[0].etag.?);
     try std.testing.expectEqual(State.running, rows[0].state);
 
@@ -201,4 +259,39 @@ test "the tables build, and a download round-trips with its segments" {
     _ = try table.claim(&run, 1, std.math.maxInt(i64));
     try std.testing.expectEqual(@as(usize, 1), try releaseStale(&db, &run));
     try std.testing.expectEqual(id, (try table.claim(&run, 2, std.math.maxInt(i64))).?.id);
+}
+
+test "a file from before `headers` and `named` gets both columns on open" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const uri = "file:fdm_store_old?mode=memory&cache=shared";
+
+    // The first release's table, made by hand; the connection keeps the
+    // in-memory file alive for the `open` below.
+    var old: Db = .init(std.testing.allocator, uri, .{ .size = 1 });
+    defer old.deinit();
+    try old.nilo_start(io, .off);
+    var run: Run = .initIo(std.testing.allocator, io);
+    defer run.deinit();
+    _ = try old.exec(&run,
+        \\CREATE TABLE "downloads" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+        \\  "url" TEXT NOT NULL, "name" TEXT NOT NULL, "path" TEXT NOT NULL, "total" INTEGER,
+        \\  "segments" INTEGER NOT NULL, "etag" TEXT, "state" TEXT NOT NULL, "reason" TEXT,
+        \\  "created_ms" INTEGER NOT NULL)
+    , .{});
+    _ = try old.exec(&run,
+        \\INSERT INTO "downloads" ("url", "name", "path", "segments", "state", "created_ms")
+        \\  VALUES ('https://x.y/old.bin', 'old.bin', '/tmp/old.bin', 0, 'done', 1)
+    , .{});
+
+    var db = try open(std.testing.allocator, io, uri);
+    defer db.deinit();
+    const rows = try all(&db, &run);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(rows[0].headers == null);
+    try std.testing.expect(!rows[0].named);
+    // And a second open finds them there and adds nothing.
+    var again = try open(std.testing.allocator, io, uri);
+    defer again.deinit();
 }

@@ -17,6 +17,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const download = @import("download.zig");
+const curl = @import("curl.zig");
 const theme = @import("theme.zig");
 
 const Io = std.Io;
@@ -140,6 +141,12 @@ pub const Model = struct {
     searching: bool = false,
     /// A delete waiting for its answer: keep the file, or not.
     confirm: ?i64 = null,
+    /// What was sent to the worker and not yet answered with `added` or
+    /// `duplicate` — the model's own copies, so a refused one can be sent
+    /// again with `force`.
+    pending: std.ArrayList(download.Add) = .empty,
+    /// A refused add waiting for its answer: add it anyway, or not.
+    dup: ?struct { of: i64, add: download.Add } = null,
     /// Something the worker said that is about nobody in particular.
     status: Text = .{},
     toast: Text = .{},
@@ -156,6 +163,15 @@ pub const Model = struct {
         m.items.deinit(m.gpa);
         m.search.deinit(m.gpa);
         if (m.input) |*in| in.deinit(m.gpa);
+        for (m.pending.items) |a| a.free(m.gpa);
+        m.pending.deinit(m.gpa);
+        if (m.dup) |d| d.add.free(m.gpa);
+    }
+
+    /// The pending add for `url`, taken out of the list.
+    fn takePending(m: *Model, url: []const u8) ?download.Add {
+        for (m.pending.items, 0..) |a, i| if (std.mem.eql(u8, a.url, url)) return m.pending.orderedRemove(i);
+        return null;
     }
 
     pub fn find(m: *Model, id: i64) ?*Item {
@@ -220,6 +236,7 @@ pub const Model = struct {
     pub fn apply(m: *Model, ev: download.Event, now: i64) void {
         switch (ev) {
             .added => |a| {
+                if (m.takePending(a.url.slice())) |sent| sent.free(m.gpa);
                 // The worker owns the list; a row it reports twice is one row.
                 if (m.find(a.id) != null) return;
                 m.items.append(m.gpa, .{
@@ -242,6 +259,7 @@ pub const Model = struct {
             },
             .started => |s| if (m.find(s.id)) |it| {
                 it.name = s.name;
+                it.path = s.path;
                 it.total = s.total;
                 it.segments = s.segments;
                 it.state = .running;
@@ -285,6 +303,11 @@ pub const Model = struct {
                 };
                 m.settle();
             },
+            .duplicate => |dup| {
+                const sent = m.takePending(dup.url.slice()) orelse return;
+                if (m.dup) |old| old.add.free(m.gpa);
+                m.dup = .{ .of = dup.of, .add = sent };
+            },
             .fatal => |t| m.status = t,
         }
     }
@@ -322,14 +345,14 @@ const Event = union(enum) {
 };
 
 /// The loop. Returns when the person quits.
-pub fn run(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, worker: *download.Worker, urls: []const []const u8) !void {
+pub fn run(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, worker: *download.Worker, adds: []const download.Add) !void {
     var m: Model = .{ .gpa = gpa };
     defer m.deinit();
     m.last_sample_ms = download.nowMs(io);
     frame = .init(gpa);
     defer frame.deinit();
 
-    for (urls) |u| try add(worker, u);
+    for (adds) |a| try send(&m, worker, a);
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -357,7 +380,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, worker
         const now = download.nowMs(io);
         switch (event) {
             .key_press => |key| if (!try handleKey(&m, worker, key, now)) {
-                        return;
+                return;
             },
             .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
             .tick => {
@@ -379,15 +402,26 @@ fn tick(loop: *vaxis.Loop(Event), io: Io, ticking: *std.atomic.Value(bool)) void
     }
 }
 
-/// Hand a URL to the worker. The item appears when the worker reports the
-/// row it made for it.
-fn add(worker: *download.Worker, url: []const u8) !void {
-    const trimmed = std.mem.trim(u8, url, " \t\r\n");
-    if (trimmed.len == 0) return;
-    // The worker frees this.
-    const owned = try worker.gpa.dupe(u8, trimmed);
-    errdefer worker.gpa.free(owned);
+/// Hand what was typed to the worker: a URL, or a pasted `curl` line. The
+/// item appears when the worker reports the row it made for it.
+fn add(m: *Model, worker: *download.Worker, line: []const u8, now: i64) !void {
+    if (std.mem.trim(u8, line, " \t\r\n").len == 0) return;
+    const parsed = curl.parse(m.gpa, line) catch |err| {
+        m.say(now, .fmt("not added: {t}", .{err}));
+        return;
+    };
+    defer parsed.free(m.gpa);
+    try send(m, worker, parsed);
+}
+
+/// One copy to the worker, which frees it; one kept, for a `duplicate`.
+fn send(m: *Model, worker: *download.Worker, a: download.Add) !void {
+    const kept = try a.dupe(m.gpa);
+    errdefer kept.free(m.gpa);
+    const owned = try a.dupe(worker.gpa);
+    errdefer owned.free(worker.gpa);
     try worker.send(.{ .add = owned });
+    try m.pending.append(m.gpa, kept);
 }
 
 /// One key into the model. False means quit.
@@ -401,7 +435,7 @@ fn handleKey(m: *Model, worker: *download.Worker, key: vaxis.Key, now: i64) !boo
             defer m.gpa.free(url);
             in.deinit(m.gpa);
             m.input = null;
-            try add(worker, url);
+            try add(m, worker, url, now);
         } else if (key.matches(vaxis.Key.escape, .{})) {
             in.deinit(m.gpa);
             m.input = null;
@@ -412,6 +446,16 @@ fn handleKey(m: *Model, worker: *download.Worker, key: vaxis.Key, now: i64) !boo
         } else if (key.text) |t| {
             try in.appendSlice(m.gpa, t);
         }
+        return true;
+    }
+    if (m.dup) |dup| {
+        if (key.matches('y', .{})) {
+            var again = dup.add;
+            again.force = true;
+            try send(m, worker, again);
+        } else if (!key.matches('n', .{}) and !key.matches(vaxis.Key.escape, .{})) return true;
+        dup.add.free(m.gpa);
+        m.dup = null;
         return true;
     }
     if (m.confirm) |id| {
@@ -497,6 +541,7 @@ fn draw(m: *Model, root: vaxis.Window, now: i64) void {
 
     if (m.input) |in| drawInput(root, in.items);
     if (m.confirm) |id| if (m.find(id)) |it| drawConfirm(root, it);
+    if (m.dup) |dup| drawDuplicate(root, m.find(dup.of), dup.add.url);
 }
 
 fn pane(win: vaxis.Window, title: []const u8, focus: bool) vaxis.Window {
@@ -717,7 +762,9 @@ fn drawDetails(m: *Model, win: vaxis.Window, now: i64) void {
 fn drawHelp(m: *Model, win: vaxis.Window, now: i64) void {
     const keys = [_][2][]const u8{
         .{ "a", "add" },      .{ "p", "pause" },  .{ "r", "resume" }, .{ "d", "delete" },
-        .{ "tab", "filter" }, .{ "/", "search" }, .{ "↑↓", "move" },  .{ "q", "quit" },
+        .{ "tab", "filter" }, .{ "/", "search" },
+        .{ "↑↓", "move" },
+        .{ "q", "quit" },
     };
     var col: u16 = 1;
     for (keys) |k| {
@@ -752,9 +799,23 @@ fn drawConfirm(root: vaxis.Window, it: *const Item) void {
     _ = box.printSegment(.{ .text = " Delete ", .style = .{ .fg = theme.err, .bold = true } }, .{ .col_offset = 2, .wrap = .none });
     _ = inner.printSegment(.{ .text = fit(it.name.slice(), inner.width -| 2), .style = theme.strong }, .{ .col_offset = 1, .wrap = .none });
     _ = inner.print(&.{
-        .{ .text = " y ", .style = theme.key },   .{ .text = "file too   ", .style = theme.muted },
-        .{ .text = "n ", .style = theme.key },    .{ .text = "keep file   ", .style = theme.muted },
-        .{ .text = "esc ", .style = theme.key },  .{ .text = "cancel", .style = theme.muted },
+        .{ .text = " y ", .style = theme.key },  .{ .text = "file too   ", .style = theme.muted },
+        .{ .text = "n ", .style = theme.key },   .{ .text = "keep file   ", .style = theme.muted },
+        .{ .text = "esc ", .style = theme.key }, .{ .text = "cancel", .style = theme.muted },
+    }, .{ .row_offset = 2, .wrap = .none });
+}
+
+fn drawDuplicate(root: vaxis.Window, of: ?*const Item, url: []const u8) void {
+    const w: u16 = @min(root.width -| 4, 70);
+    const box = root.child(.{ .x_off = (root.width - w) / 2, .y_off = root.height / 2 - 3, .width = w, .height = 5 });
+    box.fill(.{ .style = .{ .bg = theme.bg_alt } });
+    const inner = box.child(.{ .border = .{ .where = .all, .style = theme.border_focus, .glyphs = .single_rounded } });
+    _ = box.printSegment(.{ .text = " Already in the list ", .style = theme.title }, .{ .col_offset = 2, .wrap = .none });
+    const what = if (of) |it| txt("#{d} {s} has this URL or path", .{ it.id, it.name.slice() }) else txt("{s}", .{url});
+    _ = inner.printSegment(.{ .text = fit(what, inner.width -| 2), .style = theme.strong }, .{ .col_offset = 1, .wrap = .none });
+    _ = inner.print(&.{
+        .{ .text = " y ", .style = theme.key }, .{ .text = "add anyway   ", .style = theme.muted },
+        .{ .text = "n ", .style = theme.key },  .{ .text = "skip", .style = theme.muted },
     }, .{ .row_offset = 2, .wrap = .none });
 }
 

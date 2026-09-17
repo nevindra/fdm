@@ -91,12 +91,47 @@ pub const Settings = struct {
     /// half of it taken by a segment that has finished its own. Twice
     /// `min_segment`, so that both halves are worth a connection.
     steal_min: u64 = 2 << 20,
+    /// Where a download lands when `Add.out` does not say; null is the
+    /// directory the process started in. Has to outlive the worker.
+    dir: ?[]const u8 = null,
 };
 
-/// What the UI asks for. `add` hands over its string: allocated with the
-/// worker's allocator by the caller and freed by the worker.
+/// One download as the person asked for it. The strings are allocated with
+/// the worker's allocator by the caller and freed by the worker — `dupe`
+/// makes such a copy, `free` is what the worker calls.
+pub const Add = struct {
+    url: []const u8,
+    /// `Name: value`, one per entry, sent with the probe and every segment.
+    /// `Authorization` is one of them; the worker knows where it goes.
+    headers: []const []const u8 = &.{},
+    /// Where it goes, when the person said: a file, or a directory when it
+    /// ends in a separator or is one already. Null is `Settings.dir`.
+    out: ?[]const u8 = null,
+    /// Queue it although a row with the same URL or path is in the list.
+    force: bool = false,
+
+    pub fn dupe(a: Add, gpa: std.mem.Allocator) !Add {
+        var copy: Add = .{ .url = try gpa.dupe(u8, a.url), .force = a.force };
+        errdefer copy.free(gpa);
+        if (a.out) |o| copy.out = try gpa.dupe(u8, o);
+        const headers = try gpa.alloc([]const u8, a.headers.len);
+        for (headers) |*h| h.* = "";
+        copy.headers = headers;
+        for (a.headers, headers) |from, *to| to.* = try gpa.dupe(u8, from);
+        return copy;
+    }
+
+    pub fn free(a: Add, gpa: std.mem.Allocator) void {
+        gpa.free(a.url);
+        if (a.out) |o| gpa.free(o);
+        for (a.headers) |h| gpa.free(h);
+        gpa.free(a.headers);
+    }
+};
+
+/// What the UI asks for.
 pub const Command = union(enum) {
-    add: []const u8,
+    add: Add,
     cancel: i64,
     /// Run a failed or cancelled download again — from where it got to, if
     /// the server still has the same file.
@@ -122,13 +157,18 @@ pub const Event = union(enum) {
     added: struct { id: i64, url: Text, name: Text, path: Text, state: State, total: ?u64, bytes: u64, segments: u8 },
     /// Waiting its turn — on `add`, `r`, and at start for what was unfinished.
     queued: struct { id: i64 },
-    started: struct { id: i64, name: Text, total: ?u64, segments: u8, resumed: bool },
+    /// `name` and `path` may differ from `added`'s: the server's
+    /// `Content-Disposition` names a file the URL did not.
+    started: struct { id: i64, name: Text, path: Text, total: ?u64, segments: u8, resumed: bool },
     progress: struct { id: i64, bytes: u64, seg: [max_shown_segments]SegView, seg_count: u8 },
     note: struct { id: i64, text: Text },
     done: struct { id: i64, bytes: u64, elapsed_ms: i64 },
     failed: struct { id: i64, text: Text },
     cancelled: struct { id: i64 },
     removed: struct { id: i64 },
+    /// Not added: row `of` already has this URL or this path. `Add.force`
+    /// is the answer when it was meant.
+    duplicate: struct { of: i64, url: Text },
     /// The worker cannot run at all — the database would not open.
     fatal: Text,
 };
@@ -210,7 +250,7 @@ pub const Worker = struct {
 
     fn freeCommand(w: *Worker, c: Command) void {
         switch (c) {
-            .add => |url| w.gpa.free(url),
+            .add => |a| a.free(w.gpa),
             else => {},
         }
     }
@@ -346,10 +386,10 @@ fn threadMain(w: *Worker) void {
         const cmds = w.takeCommands();
         defer gpa.free(cmds);
         for (cmds) |cmd| switch (cmd) {
-            .add => |url| {
+            .add => |a| {
                 defer w.freeCommand(cmd);
-                insert(&shared, &run, url) catch |err| {
-                    w.post(.{ .fatal = .fmt("cannot add {s}: {t}", .{ url, err }) });
+                insert(&shared, &run, a) catch |err| {
+                    w.post(.{ .fatal = .fmt("cannot add {s}: {t}", .{ a.url, err }) });
                 };
             },
             .restart => |id| enqueue(&shared, &run, id) catch |err| {
@@ -420,24 +460,56 @@ fn restore(s: *Shared, run: *store.Run) void {
 }
 
 /// A new row for a URL, written down and queued before anything is fetched.
-fn insert(s: *Shared, run: *store.Run, url: []const u8) !void {
+/// Unless a row already has the URL or the path, which is reported and not
+/// added — the same file twice is two writers on one path.
+fn insert(s: *Shared, run: *store.Run, a: Add) !void {
     defer run.reset();
-    const name = nameFromUrl(url);
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_len = try std.process.currentPath(s.io, &cwd_buf);
-    const path = try std.fs.path.join(run.arena(), &.{ cwd_buf[0..cwd_len], name });
-    const row = try store.add(s.db, run, url, name, path, nowMs(s.io));
+    const arena = run.arena();
+    const url = a.url;
+    const target = try decidePath(s, arena, a);
+    const name = std.fs.path.basename(target.path);
+    if (!a.force) if (try store.duplicate(s.db, run, url, target.path)) |had| {
+        s.worker.post(.{ .duplicate = .{ .of = had.id, .url = .from(url) } });
+        return;
+    };
+    const headers: ?[]const u8 = if (a.headers.len == 0) null else try std.mem.join(arena, "\n", a.headers);
+    const row = try store.add(s.db, run, url, name, target.path, headers, target.named, nowMs(s.io));
     s.worker.post(.{ .added = .{
         .id = row.id,
         .url = .from(url),
         .name = .from(name),
-        .path = .from(path),
+        .path = .from(target.path),
         .state = .queued,
         .total = null,
         .bytes = 0,
         .segments = 0,
     } });
     try enqueue(s, run, row.id);
+}
+
+/// Where the file goes, absolute — a resume from another directory has to
+/// find it. `out` is a file, and then the name is the person's; or a
+/// directory, when it ends in a separator or is one already, and then the
+/// name is the URL's until the server offers a better one. No `out` is
+/// `Settings.dir`, or the directory the process started in.
+fn decidePath(s: *Shared, arena: std.mem.Allocator, a: Add) !struct { path: []const u8, named: bool } {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = cwd_buf[0..try std.process.currentPath(s.io, &cwd_buf)];
+    const from_url = nameFromUrl(a.url);
+    if (a.out) |out| {
+        const is_dir = std.fs.path.isSep(out[out.len - 1]) or blk: {
+            const st = Io.Dir.cwd().statFile(s.io, out, .{}) catch break :blk false;
+            break :blk st.kind == .directory;
+        };
+        // `resolve` rather than `join`: an absolute `out` stands alone.
+        const path = if (is_dir)
+            try std.fs.path.resolve(arena, &.{ cwd, out, from_url })
+        else
+            try std.fs.path.resolve(arena, &.{ cwd, out });
+        return .{ .path = path, .named = !is_dir };
+    }
+    const dir = s.worker.settings.dir orelse cwd;
+    return .{ .path = try std.fs.path.resolve(arena, &.{ cwd, dir, from_url }), .named = false };
 }
 
 /// The row, its segments and its queued job go; the file only when asked.
@@ -522,11 +594,16 @@ const Download = struct {
         const row = (try s.db.find(store.Download, scope, d.id)) orelse return error.Gone;
         const url = try gpa.dupe(u8, row.url);
         defer gpa.free(url);
-        const path = try gpa.dupe(u8, row.path);
+        var path = try gpa.dupe(u8, row.path);
         defer gpa.free(path);
-        const name: Text = .from(row.name);
+        var name: Text = .from(row.name);
+        const named = row.named;
         const stored_total = row.total;
         const stored_etag: ?Text = if (row.etag) |e| .from(e) else null;
+        const header_lines = try gpa.dupe(u8, row.headers orelse "");
+        defer gpa.free(header_lines);
+        const headers = try Headers.parse(gpa, header_lines);
+        defer headers.free(gpa);
 
         // **Each segment is its own allocation**, because a segment task
         // holds a pointer to it for as long as it runs and the list grows
@@ -552,7 +629,7 @@ const Download = struct {
         const info = blk: {
             var attempt: u32 = 1;
             while (true) : (attempt += 1) {
-                break :blk probe(d, url, &location_buf) catch |err| {
+                break :blk probe(d, url, headers, &location_buf) catch |err| {
                     if (d.why != null or err == error.Canceled or err == error.Cancelled) return err;
                     if (attempt > settings.retries) return err;
                     w.post(.{ .note = .{ .id = d.id, .text = .fmt("probe attempt {d} failed: {t}, retrying", .{ attempt, err }) } });
@@ -562,8 +639,27 @@ const Download = struct {
             }
         };
 
+        // The server's name for it, taken once: before the file exists, and
+        // never over a name the person chose.
+        if (!named and segments.items.len == 0) if (info.filename) |offered| if (!std.mem.eql(u8, offered.slice(), name.slice())) {
+            const dir = std.fs.path.dirname(path) orelse ".";
+            const moved = try std.fs.path.join(gpa, &.{ dir, offered.slice() });
+            store.rename(s.db, scope, d.id, offered.slice(), moved) catch |err| {
+                gpa.free(moved);
+                return err;
+            };
+            scope.reset();
+            gpa.free(path);
+            path = moved;
+            name = offered;
+            w.post(.{ .note = .{ .id = d.id, .text = .fmt("named {s} by the server", .{offered.slice()}) } });
+        };
+
         // Resume only when the server still has the same file and the one
-        // on disk is the size the plan expects; otherwise plan afresh.
+        // on disk is the size the plan expects; otherwise plan afresh. The
+        // directory is made on the way: `--dir` and `-o` may name one that
+        // is not there yet.
+        if (std.fs.path.dirname(path)) |dir| try Io.Dir.cwd().createDirPath(io, dir);
         const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true });
         defer file.close(io);
         const on_disk = try file.length(io);
@@ -601,13 +697,13 @@ const Download = struct {
             try file.setLength(io, total orelse 0);
         }
 
-        w.post(.{ .started = .{ .id = d.id, .name = name, .total = total, .segments = @intCast(segments.items.len), .resumed = resumable } });
+        w.post(.{ .started = .{ .id = d.id, .name = name, .path = .from(path), .total = total, .segments = @intCast(segments.items.len), .resumed = resumable } });
 
         const started = nowMs(io);
         // The segments go where the probe ended up, not where it started.
         const fetch_url = info.location orelse url;
         if (info.location) |l| w.post(.{ .note = .{ .id = d.id, .text = .fmt("redirected to {s}", .{l}) } });
-        const outcome = d.supervise(scope, file, fetch_url, &segments, ranged);
+        const outcome = d.supervise(scope, file, fetch_url, headers, &segments, ranged);
         // Whatever happened, what each segment has is written down — this
         // runs after `supervise`'s defer has stopped every task, so the
         // numbers are final.
@@ -617,6 +713,13 @@ const Download = struct {
         var bytes: u64 = 0;
         for (segments.items) |seg| bytes += seg.have();
         if (total) |n| if (bytes != n) return error.ShortDownload;
+        // The file's time is when it was published, not when it arrived —
+        // so an archive sorts where it belongs. Not worth failing over.
+        if (info.last_modified) |lm| if (parseHttpDate(lm.slice())) |secs| {
+            file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, secs) * std.time.ns_per_s } } }) catch |err| {
+                w.post(.{ .note = .{ .id = d.id, .text = .fmt("modification time not set: {t}", .{err}) } });
+            };
+        };
         try store.setState(s.db, scope, d.id, .done, null);
         scope.reset();
         w.post(.{ .done = .{ .id = d.id, .bytes = bytes, .elapsed_ms = nowMs(io) - started } });
@@ -642,7 +745,7 @@ const Download = struct {
     ///   so it has not passed it by the time the store is written; if it
     ///   somehow has, the new segment re-downloads a little, which is
     ///   waste rather than corruption.
-    fn supervise(d: *Download, scope: *store.Run, file: Io.File, url: []const u8, segments: *std.ArrayList(*Segment), ranged: bool) !void {
+    fn supervise(d: *Download, scope: *store.Run, file: Io.File, url: []const u8, headers: Headers, segments: *std.ArrayList(*Segment), ranged: bool) !void {
         const s = d.shared;
         const io = s.io;
         const w = s.worker;
@@ -706,7 +809,7 @@ const Download = struct {
                         seg.sample_bytes = seg.have();
                         seg.rate = 0;
                         seg.state.store(.running, .release);
-                        seg.future = try io.concurrent(Segment.run, .{ seg, s.client, file, io, url, ranged });
+                        seg.future = try io.concurrent(Segment.run, .{ seg, s.client, file, io, url, headers, ranged });
                         pending += 1;
                         running += 1;
                     },
@@ -865,6 +968,11 @@ const Probe = struct {
     total: ?u64,
     ranged: bool,
     etag: ?Text,
+    /// `Last-Modified` as sent, for the file's own time once it is whole.
+    last_modified: ?Text,
+    /// The name `Content-Disposition` offered, when it did and it was a
+    /// bare file name.
+    filename: ?Text,
     /// Where the redirects ended, when they went anywhere. The segments
     /// ask there directly: `mirrors.kernel.org` answers every request
     /// with a 301 to its edge and lets about eight handshakes a second
@@ -878,20 +986,30 @@ const Probe = struct {
 /// how big the whole is; a 200 says it cannot, and the body it started
 /// sending is dropped rather than drained. Either way the answer carries
 /// what identifies the object, for the next run to compare against.
-fn probe(d: *Download, url: []const u8, location_buf: *[2048]u8) !Probe {
+fn probe(d: *Download, url: []const u8, headers: Headers, location_buf: *[2048]u8) !Probe {
     var transfer: [4096]u8 = undefined;
     var redirect: [2048]u8 = undefined;
+    var hbuf: [Headers.max + 1]std.http.Header = undefined;
     var ex: fetch.Exchange = .idle;
     defer ex.end();
 
     const head = try ex.begin(d.shared.client, .{
         .method = .GET,
         .url = url,
-        .headers = &.{.{ .name = "range", .value = "bytes=0-0" }},
+        .headers = headers.with(.{ .name = "range", .value = "bytes=0-0" }, &hbuf),
+        .authorization = headers.authorization,
+        .host = headers.host,
+        .user_agent = headers.user_agent,
         .redirect_buffer = &redirect,
         .transfer_buffer = &transfer,
     });
-    const etag: ?Text = if (head.header("etag")) |e| .from(e) else if (head.header("last-modified")) |m| .from(m) else null;
+    const last_modified: ?Text = if (head.header("last-modified")) |m| .from(m) else null;
+    const etag: ?Text = if (head.header("etag")) |e| .from(e) else last_modified;
+    var name_buf: [Text.max]u8 = undefined;
+    const filename: ?Text = if (head.header("content-disposition")) |cd|
+        (if (filenameFromDisposition(cd, &name_buf)) |n| .from(n) else null)
+    else
+        null;
     // `std.http.Client` rewrites the request's URI as it follows each
     // redirect, into `redirect` above — so it is copied out here, while
     // that buffer is still alive.
@@ -904,9 +1022,9 @@ fn probe(d: *Download, url: []const u8, location_buf: *[2048]u8) !Probe {
     switch (head.status) {
         .partial_content => {
             const cr = head.header("content-range") orelse return error.NoContentRange;
-            return .{ .total = try totalFromContentRange(cr), .ranged = true, .etag = etag, .location = location };
+            return .{ .total = try totalFromContentRange(cr), .ranged = true, .etag = etag, .last_modified = last_modified, .filename = filename, .location = location };
         },
-        .ok => return .{ .total = head.content_length, .ranged = false, .etag = etag, .location = location },
+        .ok => return .{ .total = head.content_length, .ranged = false, .etag = etag, .last_modified = last_modified, .filename = filename, .location = location },
         else => {
             d.why = .fmt("HTTP {d} {s}", .{ @intFromEnum(head.status), head.status.phrase() orelse "" });
             return error.BadStatus;
@@ -993,9 +1111,9 @@ const Segment = struct {
     /// The task: one Range request for what this segment still lacks,
     /// written at its offset. Its verdict goes into the segment, not the
     /// return value, so that the supervisor can see it without blocking.
-    fn run(seg: *Segment, client: *fetch.Client, file: Io.File, io: Io, url: []const u8, ranged: bool) void {
+    fn run(seg: *Segment, client: *fetch.Client, file: Io.File, io: Io, url: []const u8, headers: Headers, ranged: bool) void {
         seg.state.store(.running, .release);
-        runInner(seg, client, file, io, url, ranged) catch |err| {
+        runInner(seg, client, file, io, url, headers, ranged) catch |err| {
             seg.err = err;
             seg.state.store(.failed, .release);
             return;
@@ -1003,7 +1121,7 @@ const Segment = struct {
         seg.state.store(.ok, .release);
     }
 
-    fn runInner(seg: *Segment, client: *fetch.Client, file: Io.File, io: Io, url: []const u8, ranged: bool) !void {
+    fn runInner(seg: *Segment, client: *fetch.Client, file: Io.File, io: Io, url: []const u8, headers: Headers, ranged: bool) !void {
         // Both buffers live on this task's stack for the life of the
         // transfer. The writer's buffer is not optional: `std.Io.net`'s
         // stream writes straight into it and asserts on an empty one.
@@ -1011,6 +1129,7 @@ const Segment = struct {
         var wbuf: [64 << 10]u8 = undefined;
         var redirect: [2048]u8 = undefined;
         var range_buf: [64]u8 = undefined;
+        var hbuf: [Headers.max + 1]std.http.Header = undefined;
 
         const from = seg.start + seg.have();
         // Read once: a steal can move `end` between the request and its
@@ -1018,14 +1137,17 @@ const Segment = struct {
         // read loop below follows the atomic and stops at the new boundary.
         const asked_end = seg.end.load(.acquire);
         const range = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ from, asked_end -| 1 });
-        const headers: []const std.http.Header = if (ranged) &.{.{ .name = "range", .value = range }} else &.{};
+        const sent = headers.with(if (ranged) .{ .name = "range", .value = range } else null, &hbuf);
 
         var ex: fetch.Exchange = .idle;
         defer ex.end();
         const head = try ex.begin(client, .{
             .method = .GET,
             .url = url,
-            .headers = headers,
+            .headers = sent,
+            .authorization = headers.authorization,
+            .host = headers.host,
+            .user_agent = headers.user_agent,
             .redirect_buffer = &redirect,
             .transfer_buffer = &transfer,
         });
@@ -1069,6 +1191,148 @@ const Segment = struct {
     }
 };
 
+// ---------------------------------------------------------------- headers
+
+/// What goes out with every request for one download, read off the row.
+/// Three names are kept apart because `std.http.Client` writes them itself
+/// and would otherwise send them twice; the rest go verbatim, in order.
+const Headers = struct {
+    extra: []const std.http.Header = &.{},
+    authorization: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
+
+    /// More than a browser's "Copy as cURL" produces.
+    const max = 32;
+
+    /// `Name: value` per line. The result points into `lines`, which has
+    /// to outlive it; a line without a colon is skipped.
+    fn parse(gpa: std.mem.Allocator, lines: []const u8) !Headers {
+        var list: std.ArrayList(std.http.Header) = .empty;
+        errdefer list.deinit(gpa);
+        var h: Headers = .{};
+        var it = std.mem.splitScalar(u8, lines, '\n');
+        while (it.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t\r");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
+            if (name.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(name, "authorization")) {
+                h.authorization = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "host")) {
+                h.host = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "user-agent")) {
+                h.user_agent = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "connection") or
+                std.ascii.eqlIgnoreCase(name, "accept-encoding") or
+                std.ascii.eqlIgnoreCase(name, "content-length"))
+            {
+                // The client decides these: the body is read uncompressed,
+                // the connection is kept, and there is no body to measure.
+                continue;
+            } else {
+                if (list.items.len == max) return error.TooManyHeaders;
+                try list.append(gpa, .{ .name = name, .value = value });
+            }
+        }
+        h.extra = try list.toOwnedSlice(gpa);
+        return h;
+    }
+
+    fn free(h: Headers, gpa: std.mem.Allocator) void {
+        gpa.free(h.extra);
+    }
+
+    /// `first`, then the rest, in `buf` — which holds `max + 1`.
+    fn with(h: Headers, first: ?std.http.Header, buf: []std.http.Header) []const std.http.Header {
+        var n: usize = 0;
+        if (first) |f| {
+            buf[n] = f;
+            n += 1;
+        }
+        for (h.extra) |e| {
+            buf[n] = e;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+};
+
+/// The name in `attachment; filename="a.bin"` or in
+/// `filename*=UTF-8''a%20b.bin`, the starred form first when both are
+/// there. A bare name only: a server does not get to choose the directory,
+/// so anything with a separator, or `.` or `..`, is no name at all.
+fn filenameFromDisposition(value: []const u8, buf: []u8) ?[]const u8 {
+    var plain: ?[]const u8 = null;
+    var starred: ?[]const u8 = null;
+    var params = std.mem.splitScalar(u8, value, ';');
+    while (params.next()) |param| {
+        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        const key = std.mem.trim(u8, param[0..eq], " \t");
+        const raw = std.mem.trim(u8, param[eq + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "filename*")) {
+            // charset'lang'percent-encoded
+            const q = std.mem.indexOf(u8, raw, "''") orelse continue;
+            starred = raw[q + 2 ..];
+        } else if (std.ascii.eqlIgnoreCase(key, "filename")) {
+            plain = std.mem.trim(u8, raw, "\"");
+        }
+    }
+    const chosen = starred orelse plain orelse return null;
+    if (chosen.len > buf.len) return null;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < chosen.len) : (i += 1) {
+        if (chosen[i] == '%' and i + 2 < chosen.len) {
+            buf[n] = std.fmt.parseInt(u8, chosen[i + 1 .. i + 3], 16) catch {
+                buf[n] = '%';
+                n += 1;
+                continue;
+            };
+            i += 2;
+        } else buf[n] = chosen[i];
+        n += 1;
+    }
+    const name = buf[0..n];
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return null;
+    for (name) |c| if (c == '/' or c == '\\' or c == 0) return null;
+    return name;
+}
+
+/// `Tue, 15 Nov 1994 12:45:26 GMT` as seconds since the epoch — the one
+/// form HTTP/1.1 sends. Anything else is null, which is not worth failing
+/// a download over.
+fn parseHttpDate(s: []const u8) ?i64 {
+    var it = std.mem.tokenizeAny(u8, s, " ,:");
+    _ = it.next() orelse return null; // weekday
+    const day = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    const mon = monthOf(it.next() orelse return null) orelse return null;
+    const year = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    const hour = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    const min = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    const sec = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    if (day < 1 or day > 31 or hour > 23 or min > 59 or sec > 60) return null;
+    return daysFromCivil(year, mon, day) * 86_400 + hour * 3600 + min * 60 + sec;
+}
+
+fn monthOf(name: []const u8) ?i64 {
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (months, 1..) |m, i| if (std.ascii.eqlIgnoreCase(m, name)) return @intCast(i);
+    return null;
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date; Howard Hinnant's
+/// `days_from_civil`, which is what every libc does.
+fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
+    const y = if (month <= 2) year - 1 else year;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp = if (month > 2) month - 3 else month + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
 // ------------------------------------------------------------------ misc
 
 pub fn nowMs(io: Io) i64 {
@@ -1085,6 +1349,44 @@ pub fn nameFromUrl(url: []const u8) []const u8 {
 test "the name is the last path segment without the query" {
     try std.testing.expectEqualStrings("a.bin", nameFromUrl("https://x.y/p/a.bin?sig=1"));
     try std.testing.expectEqualStrings("download", nameFromUrl("https://x.y/"));
+}
+
+test "headers: authorization, host and user-agent are set apart, the client's own are dropped, the rest kept in order" {
+    const gpa = std.testing.allocator;
+    const h = try Headers.parse(gpa, "Cookie: a=b\nAuthorization: Bearer t\nHost: x.y\nConnection: close\nuser-agent: Mozilla/5.0\nnocolon\nReferer: https://x.y/\n");
+    defer h.free(gpa);
+    try std.testing.expectEqualStrings("Bearer t", h.authorization.?);
+    try std.testing.expectEqualStrings("x.y", h.host.?);
+    try std.testing.expectEqualStrings("Mozilla/5.0", h.user_agent.?);
+    try std.testing.expectEqual(@as(usize, 2), h.extra.len);
+    try std.testing.expectEqualStrings("Cookie", h.extra[0].name);
+    try std.testing.expectEqualStrings("a=b", h.extra[0].value);
+    try std.testing.expectEqualStrings("Referer", h.extra[1].name);
+
+    var buf: [Headers.max + 1]std.http.Header = undefined;
+    const sent = h.with(.{ .name = "range", .value = "bytes=0-0" }, &buf);
+    try std.testing.expectEqual(@as(usize, 3), sent.len);
+    try std.testing.expectEqualStrings("range", sent[0].name);
+    try std.testing.expectEqual(@as(usize, 2), h.with(null, &buf).len);
+}
+
+test "content-disposition: a plain name, a starred one over it, and no path" {
+    var buf: [Text.max]u8 = undefined;
+    try std.testing.expectEqualStrings("a.bin", filenameFromDisposition("attachment; filename=\"a.bin\"", &buf).?);
+    try std.testing.expectEqualStrings("a.bin", filenameFromDisposition("inline; filename=a.bin", &buf).?);
+    try std.testing.expectEqualStrings("a b.bin", filenameFromDisposition("attachment; filename=\"x.bin\"; filename*=UTF-8''a%20b.bin", &buf).?);
+    try std.testing.expect(filenameFromDisposition("attachment; filename=\"../etc/passwd\"", &buf) == null);
+    try std.testing.expect(filenameFromDisposition("attachment; filename*=UTF-8''..%2Fx", &buf) == null);
+    try std.testing.expect(filenameFromDisposition("attachment", &buf) == null);
+    try std.testing.expect(filenameFromDisposition("attachment; filename=\"\"", &buf) == null);
+}
+
+test "an http date is seconds since the epoch, and anything else is nothing" {
+    try std.testing.expectEqual(@as(?i64, 784_903_526), parseHttpDate("Tue, 15 Nov 1994 12:45:26 GMT"));
+    try std.testing.expectEqual(@as(?i64, 0), parseHttpDate("Thu, 01 Jan 1970 00:00:00 GMT"));
+    try std.testing.expectEqual(@as(?i64, 1_709_164_800), parseHttpDate("Thu, 29 Feb 2024 00:00:00 GMT"));
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("yesterday"));
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("Tue, 15 Nov 1994"));
 }
 
 test "a content-range total is parsed, and a star is unknown" {

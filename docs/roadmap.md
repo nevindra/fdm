@@ -16,31 +16,18 @@ is twenty years of options for the same job, and the entries marked
 *aria2* are the ones that survived that long. Where both have the same
 thing it is a strong signal the thing is wanted. What fdm already has
 (sixteen connections, the 0.3× mean reconnect, the steal, resume on
-`ETag`, the `nilo_job` queue, `--headless`, `fdm update`) is not listed.
+`ETag`, the `nilo_job` queue, `--headless`, `fdm update`, headers and a
+pasted `curl` line, `-o` and `--dir` and the server's name, the refused
+duplicate, `--batch` and `--json` and `fdm ls`, the remote mtime) is not
+listed.
 
 ## Next: cheap, and the shape of the program does not move
 
 Each of these lands in `store.zig` and `download.zig`, or in `main.zig`'s
-flag parsing, and nothing else has to change.
-
-**Headers per download, and a paste of "Copy as cURL".** *Surge, aria2
-`--header`, `--referer`, `--user-agent`.* fdm sends `range` and nothing
-else (`download.zig`, the segment request), so anything behind a cookie,
-a signed `Referer` or a bearer token cannot be fetched at all: Google
-Drive, most file hosts, any CDN with a session. A `headers` column on
-`downloads`, `--header` on the command line, and a parser for the `curl`
-line a browser's "Copy as cURL" produces, which is `-H` and `-b` and the
-URL. This is the one entry that opens a door to others (the browser
-extension below needs it), and it is the most common reason a link fails
-today. Costs: one column, one small parser, nothing per byte.
-
-**`-o` and a default download directory.** *Surge
-`default_download_dir`, aria2 `--dir`/`--out`.* Everything lands in the
-cwd. A per-URL `-o path`, a default in config, and the name from
-`Content-Disposition` when the server sends one (aria2, curl `-J`)
-rather than the URL's last path segment, which on a redirecting host is
-often `download` or a hash. Costs: a `path` decided at probe time rather
-than at add time, which the store already holds.
+flag parsing, and nothing else has to change. The first batch of them
+did — headers, `-o`, the duplicate, `--batch`/`--json`, the mtime — and
+what that cost is in `history.md`; `Add` now carries what the person
+asked for, so the next per-download option is a field on it.
 
 **A rate limit, per download and global.** *Surge `surge limit <id>
 <speed>`, `--global`; aria2 `--max-download-limit`,
@@ -67,16 +54,6 @@ disk, then a steal hands it more work; Surge's rule is the right one:
 fail at once, no retry, no steal, no mirror, write the state so resume
 carries on once there is room. Costs: nothing per byte.
 
-**A duplicate is refused before it is queued.** *Surge
-`warn_on_duplicate`.* One query on `downloads` for the same URL or the
-same target path, and a prompt in the TUI, a non-zero exit in
-`--headless`. Costs: one indexed lookup at add.
-
-**`--batch file`, and `ls --json`.** *Surge `--batch`, aria2
-`--input-file`.* One URL a line, `#` comments, for scripts. `--headless`
-already prints one line per event; a `--json` form of that line and of
-the list is a format, not a feature. Costs: none per byte.
-
 **A checksum, verified at the end.** *aria2 `--checksum
 sha-256=…`.* Release pages ship a sums file next to the binary and
 nobody checks it by hand. `--sha256 <hex>` on add, hashed while the
@@ -85,11 +62,6 @@ failure with the file kept for inspection. `fdm update` already does
 exactly this for itself (`update.zig`); the same code, opened to any
 download. Costs: one hash pass over the file, which is disk-bound and
 after the network is done.
-
-**The remote modification time, kept.** *aria2 `--remote-time`, wget
-`-N`.* `Last-Modified` is already read for the resume check; set it as
-the file's mtime on completion, so a downloaded archive sorts where it
-was published rather than when it arrived. Costs: one `utimes`.
 
 **Auto-resume on start, opt-in.** *Surge `auto_resume`.* Running
 downloads already resume on the next start; paused ones stay paused,
@@ -175,9 +147,10 @@ changing; whether it should is a decision, not a gap.
 Waiting on: a second client that wants it.
 
 **A browser extension.** *Surge, port 1700.* Intercept the browser's
-download and hand it over with its cookies. Needs the daemon and needs
-the headers entry; the extension itself is a hundred lines of
-JavaScript that is not fdm's to write until both are there.
+download and hand it over with its cookies. Needs the daemon; the
+headers it would hand over are taken since `Add.headers`. The extension
+itself is a hundred lines of JavaScript that is not fdm's to write until
+the daemon is there.
 Waiting on: the daemon.
 
 **Clipboard monitor.** *Surge `clipboard_monitor`, uGet.* Watch the

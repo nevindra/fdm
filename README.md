@@ -40,25 +40,38 @@ person watching a download on the other two.
 ## Use
 
 ```
-fdm [url ...] [-n segments] [-p parallel] [--stall ms] [--retries n] [--db file] [--headless]
+fdm [url ...] [-o path] [-H header] [--dir path] [--batch file] [--force]
+    [-n segments] [-p parallel] [--stall ms] [--retries n] [--db file] [--headless] [--json]
+fdm ls [--json]
 ```
+
+A `url` may also be the line a browser's "Copy as cURL" writes, quoted as
+one argument: the URL, every `-H`, `-b`, `-A`, `-e`, `-u` and `-o` on it
+are read, and the rest of curl's options are skipped.
 
 | flag | default | what |
 |---|---|---|
+| `-o` | | where the n-th URL goes: a file, or a directory when it ends in `/` or is one |
+| `-H` | | a `Name: value` sent with every request for these URLs; repeatable. `Authorization`, `Host` and `User-Agent` go where `std.http` wants them |
+| `--dir` | the cwd | where a URL without `-o` lands |
+| `--batch` | | a file with one URL, or one `curl` line, per line; `#` comments, `\` continues a line |
+| `--force` | | add a URL that is already in the list, or whose file is |
 | `-n` | 16 | connections per download |
 | `-p` | 3 | downloads running at once; the rest queue |
 | `--stall` | 10000 | ms a segment may go without a byte before it is reconnected |
 | `--retries` | 3 | attempts per segment, and per probe, before the download fails |
 | `--db` | `$XDG_DATA_HOME/fdm/fdm.db` | the list, the segments and the queue |
-| `--headless` | | no screen; one line per event, exit when the URLs given are done |
+| `--headless` | | no screen; one line per event, exit when the URLs given are done — non-zero if one failed or was a duplicate |
+| `--json` | | each `--headless` line, and `fdm ls`, as JSON |
 
-`fdm update` and `fdm --version` are the two subcommands.
+`fdm ls` prints the list without starting anything; `fdm update` and
+`fdm --version` are the other two subcommands.
 
 In the terminal:
 
 | key | |
 |---|---|
-| `a` | add a URL |
+| `a` | add a URL, or paste a `curl` line |
 | `p` | pause the selected download |
 | `r` | resume a paused or failed one |
 | `d` | delete it, asking whether the file goes too |
@@ -67,7 +80,12 @@ In the terminal:
 | `j` `k` `↑` `↓` `g` `G` | move |
 | `q` | quit — running downloads resume on the next start |
 
-Files land in the current directory under the URL's last path segment.
+A file lands in the current directory, or `--dir`, under the URL's last
+path segment — unless the server's `Content-Disposition` names it, which
+wins over a name like `download` or a hash, or `-o` does, which wins over
+both. The file's modification time is the server's `Last-Modified`, so an
+archive sorts where it was published. A URL already in the list, or a
+path already taken, is refused with a prompt (`--force` in a script).
 Two panes at 100 columns or wider: the list on the left; the network
 graph, the selected download's URL, path, ETA, one bar per segment and
 its log on the right. `std.log` goes to `<db>.log`, never the terminal.
@@ -115,9 +133,10 @@ second and nothing can be won. Where a host caps a connection
 | `src/store.zig` | the tables as structs — `downloads`, `segments`, and `nilo_job`'s own — and the statements the worker makes against them |
 | `src/dns.zig` | the worker's Io with one vtable slot swapped: a host is resolved once a download |
 | `src/tui.zig` | the terminal front: `Item` is the model, `Model.apply` is `update`, `draw` is the view |
+| `src/curl.zig` | a pasted `curl` line, or a URL, into one `Add` |
 | `src/theme.zig` | every colour, in one place |
 | `src/update.zig` | `fdm update`: the latest release, checked against its `sha256sums.txt`, renamed over this binary |
-| `src/main.zig` | wiring, `--headless`, and where the database lives on each platform |
+| `src/main.zig` | wiring, the flags, `--headless`, `fdm ls`, and where the database lives on each platform |
 | `.github/workflows` | `ci.yml` tests on all three platforms and cross-builds every target; `release.yml` turns a `v*` tag into a release |
 | `bench/compare.py` | curl, fdm and Surge against the same URLs, in a pty, interleaved |
 | `docs/history.md` | what was tried, measured, and found wrong on the way here |
