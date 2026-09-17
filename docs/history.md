@@ -231,3 +231,58 @@ curl line carrying the header and finished; a paused row given a new
 URL with `u` resumed from 684 KB on the new link; `--auto-resume`
 queued a paused row where a plain start left it paused.
 
+## The link that has room, and the frontier
+
+The roadmap's tail entry said "stealing earlier and smaller near the
+end, worth perhaps a second", and the grace-period entry said "does not
+land without a number". Neither number could be taken on this machine:
+a cloud VM whose NIC hands out a burst allowance and then polices at
+100 Mbit, so whichever tool ran first after a pause got 150 MB in a
+second and the next got 12 MB/s, and three rounds of the same tool on
+`cdn.kernel.org` came out 3.3 s, 13.1 s, 12.9 s. `bench/local/` is the
+answer: nginx on the loopback as three kinds of host and `tc` as four
+kinds of link, so a run comes out the same twice and the thing that
+changed between two runs is the code.
+
+**On a shared link, reconnecting a slow segment cost five seconds in
+twenty.** 100 Mbit and 40 ms, 200 MB: curl 17.3 s, fdm-16 22.5 s, and
+`--slow 0` 17.5 s. Sixteen connections through one FIFO divide it
+unevenly — a plain probe saw eight segments at 0–80 KB/s against a mean
+of 858 — and the one at 80 KB/s is slow because the others are fast:
+cancelling it drops what was in flight for it and the replacement
+starts in slow start, and the total goes down. The same is true of a
+steal. Both now wait for the download's total to run under 0.75× its
+usual second for two seconds, or under half for one — and *usual* is the
+median of the last ten, because the burst bucket makes the best second
+ten times the rest and everything after it looked like room. And if the
+total is lower two seconds after an action than before it, the link
+was the limit after all, and both hold for ten seconds. 16.5 s.
+
+**On a host whose connections differ, a split by sixteen decided once
+is the wrong shape.** nginx with `limit_rate` by source port — 40% of
+connections at 300 KB/s, 30% at 1 MB/s, 30% at 3 MB/s, which is what
+`mirrors.kernel.org` looks like from one client — 60 MB: fdm 12.4 s,
+aria2 7.2 s. The fast connections finished their 3.75 MB and the slow
+ones were still holding theirs, and the steal, which needed two
+megabytes left and a megabyte for each half, never fired on a segment
+that size. aria2 hands out one-megabyte pieces as connections come
+free, which is why it does not have the problem. fdm now plans a quarter
+of the file and hands the rest out from a frontier as connections
+finish, each chunk sized to eight seconds at the rate that connection
+just showed and to a thirty-second of what is left, so the last chunks
+are small and everyone ends together; the steal — judged in seconds
+now, and splitting by the two rates — is for when the frontier is gone.
+5.4 s, which is the link. A connection is reused across chunks: nginx's
+log shows 23 requests on 16 connections, so the cost of a chunk is one
+round trip idle, 2.5% of eight seconds at 200 ms.
+
+**Half a second of the start was the queue's poll.** 100 KB: curl
+0.1 s, aria2 0.2 s, fdm 0.7 s. `nilo_job` polled every 500 ms and the
+command loop every 100; 100 and 50 now, and 0.2 s. The idle TUI costs
+0.4% of a core for it.
+
+And `zig build` for the debug binary takes 90 s here against 3 s for the
+tests, which is why every variant was a flag rather than a rebuild:
+`--slow`, `--slow-checks`, `--slow-per-check`, `--steal-min`, and
+`compare.py --variant name=flags` runs one more fdm beside the default.
+

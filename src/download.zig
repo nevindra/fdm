@@ -407,7 +407,10 @@ fn threadMain(w: *Worker) void {
     defer shared.active.deinit(gpa);
     var jobs: Jobs = .open(gpa, &table, .{ .shared = &shared }, .{
         .workers = w.settings.parallel,
-        .poll_ms = 500,
+        // The latency between `add` and the first byte is this plus the
+        // command loop's sleep: a tenth of a second, against the half
+        // second it was, for one small query per worker per tick.
+        .poll_ms = 100,
     });
     shared.jobs = &jobs;
     jobs.nilo_start(io, .off) catch return;
@@ -471,7 +474,7 @@ fn threadMain(w: *Worker) void {
                 return;
             },
         };
-        Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake) catch return;
+        Io.sleep(io, Io.Duration.fromMilliseconds(50), .awake) catch return;
     }
 }
 
@@ -1069,7 +1072,10 @@ const Download = struct {
                 last_saved_ms = now;
                 persist(d, scope, segments.items);
             }
-            try Io.sleep(io, Io.Duration.fromMilliseconds(100), .awake);
+            // Fifty milliseconds: the gap between a chunk ending and the
+            // next one starting on that connection is this plus a round
+            // trip, and the loop is a few atomics.
+            try Io.sleep(io, Io.Duration.fromMilliseconds(50), .awake);
         }
     }
 
@@ -1091,15 +1097,15 @@ const Download = struct {
                 rate = @as(f64, @floatFromInt(seg.have())) / (@as(f64, @floatFromInt(seg.finished_ms - seg.started_ms)) / 1000.0);
             }
         }
-        // Never more than a sixteenth of the file, nor of what is left to
-        // hand out — so the last chunks are small and the connections
-        // finish together rather than one of them last with eight
-        // seconds of work. A quarter of a megabyte at the least: a
+        // Never more than a sixteenth of the file, nor a thirty-second of
+        // what is left to hand out — so the last chunks are small and the
+        // connections finish together rather than one of them last with
+        // eight seconds of work. A quarter of a megabyte at the least: a
         // request's round trip is worth that much.
         const unassigned = total - d.frontier;
         const cap = @max(settings.min_segment, total / 16);
         const want: u64 = if (rate > 0) @intFromFloat(rate * settings.chunk_secs) else first_len;
-        const size = @min(@max(256 << 10, @min(want, cap, unassigned / @as(u64, settings.segments))), unassigned);
+        const size = @min(@max(256 << 10, @min(want, cap, unassigned / (2 * @as(u64, settings.segments)))), unassigned);
         const row = try store.extend(s.db, scope, d.id, @intCast(segments.items.len), @intCast(d.frontier), @intCast(d.frontier + size));
         scope.reset();
         const made = try Segment.create(s.worker.gpa, row);

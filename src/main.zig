@@ -289,7 +289,7 @@ fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, add
     var settled = !bare;
     const began = download.nowMs(io);
     while (pending > 0 or !settled) {
-        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake);
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
         const now = download.nowMs(io);
         const events = try worker.take();
         defer gpa.free(events);

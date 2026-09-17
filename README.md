@@ -64,6 +64,10 @@ are read, and the rest of curl's options are skipped.
 | `--stall` | 10000 | ms a segment may go without a byte before it is reconnected |
 | `--retries` | 3 | attempts per segment, and per probe, before the download fails |
 | `--retry-wait` | 0 | ms a failed segment waits before its next attempt |
+| `--slow` | 0.3 | a segment under this fraction of the others' mean is reconnected; 0 turns it off |
+| `--slow-checks` | 1 | health checks (two seconds apart) a segment must be slow for first |
+| `--slow-per-check` | 255 | reconnects allowed in one check |
+| `--steal-min` | 2 | seconds a segment must still need before a finished one takes part of it |
 | `--auto-resume` | | at start, queue the paused downloads too |
 | `--db` | `$XDG_DATA_HOME/fdm/fdm.db` | the list, the segments and the queue |
 | `--headless` | | no screen; one line per event, exit when the URLs given are done — non-zero if one failed or was a duplicate |
@@ -131,12 +135,16 @@ the workers, and a cancelled worker hands its row back to the queue.
 
 ## Speed
 
-Against curl and Surge, three interleaved rounds a host, ReleaseSafe —
-[`bench/result.md`](bench/result.md) has the tables and how they were
-taken. Where one connection gets the whole link, fdm is curl to within a
-second and nothing can be won. Where a host caps a connection
-(speedtest.tele2.net, 0.3 MB/s each), fdm with sixteen finishes 100 MB in
-12–16 s against curl's 345 s and Surge's 37 s.
+Against curl, aria2 and Surge, three interleaved rounds a host,
+ReleaseSafe — [`bench/result.md`](bench/result.md) has the tables and
+how they were taken, on real hosts and on a loopback shaped into four
+kinds of link (`bench/local/`). Where one connection gets the whole
+link, fdm is curl less a second: 16.6 s to curl's 17.4 and aria2's 17.8
+for 200 MB at 100 Mbit. Where a host caps each connection
+(speedtest.tele2.net), fdm-16 does 100 MB in 19 s to aria2's 21 and
+Surge's 31. Where connections differ, as a CDN's edges do, 60 MB takes
+fdm 5.2 s, aria2 8.0 s and Surge 15.1 s, because fdm hands the file out
+as connections finish rather than splitting it once.
 
 ## Layout
 
@@ -152,7 +160,8 @@ second and nothing can be won. Where a host caps a connection
 | `src/update.zig` | `fdm update`: the latest release, checked against its `sha256sums.txt`, renamed over this binary |
 | `src/main.zig` | wiring, the flags, `--headless`, `fdm ls`, and where the database lives on each platform |
 | `.github/workflows` | `ci.yml` tests on all three platforms and cross-builds every target; `release.yml` turns a `v*` tag into a release |
-| `bench/compare.py` | curl, fdm and Surge against the same URLs, in a pty, interleaved |
+| `bench/compare.py` | curl, aria2, fdm and Surge against the same URLs, in a pty, interleaved; `--variant` for one more fdm with other flags |
+| `bench/local/` | nginx as three kinds of host and `tc` as four kinds of link, so a tail can be measured twice and come out the same |
 | `docs/history.md` | what was tried, measured, and found wrong on the way here |
 | `docs/roadmap.md` | what is coming, what is being weighed and what is refused, much of it read off Surge and aria2 |
 
