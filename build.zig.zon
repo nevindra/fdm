@@ -4,9 +4,12 @@
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x8189ddc657527c5e,
     .dependencies = .{
-        // By path for now: the spike measures the working copy of nilo next
-        // door rather than a published tag.
-        .nilo = .{ .path = "../nilo" },
+        // Pinned to a nilo commit, so a clone builds with nothing beside it.
+        // To work on both at once, swap this for `.path = "../nilo"`.
+        .nilo = .{
+            .url = "git+https://github.com/nevindra/nilo#27a5f6637d32e32f42bace6bea9f91ee54c903ab",
+            .hash = "nilo-0.4.0-5HEqwoAdSwBT9crDx2varFbFR4luxboD5lApOGmtSl4C",
+        },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis#f37c42a3b324131c131d066767968e1f5b976453",
             .hash = "vaxis-0.6.0-BWNV_AIQDADLTDo5jCn27pBWJBvi-sTrSkSKwITQWgUV",

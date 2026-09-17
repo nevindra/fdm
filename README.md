@@ -6,9 +6,13 @@ so a [Native SDK](https://native-sdk.dev/) window could sit on it instead;
 for now the terminal is the product.
 
 ```
-zig build
+zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file]
 ```
+
+nilo is fetched by commit from `build.zig.zon`; nothing has to sit beside
+the checkout. To work on both at once, swap that entry for
+`.path = "../nilo"`.
 
 `a` adds a URL, `p` pauses the selected download, `r` resumes a paused or
 failed one, `d` deletes it (asking whether the file goes too), `tab`
