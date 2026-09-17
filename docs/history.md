@@ -195,3 +195,39 @@ download with it; `--dir` made on the way; `server name.bin` chosen over
 same in the TUI through tmux, the prompt answered `y`, a curl line pasted
 after `a`. Every hash matches.
 
+## The second batch, and the two bugs the disk test found
+
+`--sha256`, `refresh`, the disk check, `--auto-resume` and `--retry-wait`
+were each a field on `Add` or a number in `Settings`, as the roadmap
+said. What was not in the roadmap was what a 2 MB tmpfs and a server
+that sends no `Content-Length` turned up.
+
+**An unknown length crashed the plan.** One segment to
+`maxInt(u64)` is how a task says "no end", and the plan wrote that into
+a signed column: `@intCast` panicked on the first 200 without a length,
+which is every `nolen` server and had never been tried. The row now
+holds `maxInt(i64)` and `Segment.create` maps it back.
+
+**A full disk arrived as `WriteFailed`.** `Reader.stream` into a
+`File.Writer` reports the writer's failure as `error.WriteFailed` and
+keeps the real one in `fw.err`; the segment now returns that, so the
+supervisor sees `NoSpaceLeft` and stops at once — one attempt, 2 MB
+written down, no steal — where before it was four `WriteFailed`s and a
+job retry. `NoSpaceLeft` and `ChecksumMismatch` join `BadStatus` in
+`Fetch.final`.
+
+**`zig build test` analyses almost none of the program.** The test
+runner never calls `main`, and `test { _ = tui; }` pulls in the module's
+tests and nothing else, so a `switch` on `Event` missing two arms passed
+fifteen tests. `zig build` is the compile check; the tests are the
+tests.
+
+Against the local server: a right `--sha256` verified, a wrong one
+failed once with the file kept and no job retry; a `--batch` line
+`url sha256=<hex>`; a 5 MB file into the 2 MB tmpfs refused at the probe
+with `needs 4 MB, 2 MB free`; the same file without a length failed
+mid-write as `NoSpaceLeft` in one attempt; a 403 row refreshed with a
+curl line carrying the header and finished; a paused row given a new
+URL with `u` resumed from 684 KB on the new link; `--auto-resume`
+queued a paused row where a plain start left it paused.
+

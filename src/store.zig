@@ -49,6 +49,8 @@ pub const Download = struct {
     /// The person chose the file name, so the server's
     /// `Content-Disposition` does not rename it.
     named: bool,
+    /// The hex the whole file has to hash to, when the person said.
+    sha256: ?[]const u8,
 };
 
 pub const Segment = struct {
@@ -89,6 +91,7 @@ fn addMissingColumns(db: *Db, run: *Run) !void {
     const added = [_]struct { name: []const u8, sql: []const u8 }{
         .{ .name = "headers", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"headers\" TEXT" },
         .{ .name = "named", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"named\" INTEGER NOT NULL DEFAULT 0" },
+        .{ .name = "sha256", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"sha256\" TEXT" },
     };
     const Col = struct {
         pub const nilo_table = .projection;
@@ -123,7 +126,7 @@ pub fn segmentsOf(db: *Db, run: *Run, id: i64) ![]Segment {
     return db.select(Segment, run, .{ .where = .{ .download_id = id }, .order = .{ .idx = .asc } });
 }
 
-pub fn add(db: *Db, run: *Run, url: []const u8, name: []const u8, path: []const u8, headers: ?[]const u8, named: bool, now_ms: i64) !Download {
+pub fn add(db: *Db, run: *Run, url: []const u8, name: []const u8, path: []const u8, headers: ?[]const u8, named: bool, sha256: ?[]const u8, now_ms: i64) !Download {
     return db.insert(Download, run, .{
         .url = url,
         .name = name,
@@ -136,7 +139,20 @@ pub fn add(db: *Db, run: *Run, url: []const u8, name: []const u8, path: []const 
         .created_ms = now_ms,
         .headers = headers,
         .named = named,
+        .sha256 = sha256,
     });
+}
+
+/// A new link for the same file. The headers change only when new ones
+/// came with it; `etag` and `total` stay, so the next run compares the
+/// new server's answer against what the old one said and resumes only if
+/// they agree.
+pub fn refresh(db: *Db, run: *Run, id: i64, url: []const u8, headers: ?[]const u8) !void {
+    if (headers) |h| {
+        _ = try db.update(Download, run, .{ .set = .{ .url = url, .headers = h }, .where = .{ .id = id } });
+    } else {
+        _ = try db.update(Download, run, .{ .set = .{ .url = url }, .where = .{ .id = id } });
+    }
 }
 
 /// A row that already has this URL, or failing that this path — whatever
@@ -230,10 +246,17 @@ test "the tables build, and a download round-trips with its segments" {
     var run: Run = .initIo(std.testing.allocator, io);
     defer run.deinit();
 
-    const d = try add(&db, &run, "https://x.y/a.bin", "a.bin", "/tmp/a.bin", "Cookie: k=v", false, 1);
+    const d = try add(&db, &run, "https://x.y/a.bin", "a.bin", "/tmp/a.bin", "Cookie: k=v", false, "ab", 1);
     try std.testing.expectEqual(State.queued, d.state);
     try std.testing.expectEqualStrings("Cookie: k=v", d.headers.?);
+    try std.testing.expectEqualStrings("ab", d.sha256.?);
     try std.testing.expect(!d.named);
+
+    // A refresh moves the URL, and the headers only when it brought some.
+    try refresh(&db, &run, d.id, "https://mirror/a.bin", null);
+    try std.testing.expectEqualStrings("Cookie: k=v", (try db.find(Download, &run, d.id)).?.headers.?);
+    try refresh(&db, &run, d.id, "https://x.y/a.bin", "X: y");
+    try std.testing.expectEqualStrings("X: y", (try db.find(Download, &run, d.id)).?.headers.?);
 
     // The same URL, or the same path, is found; another is not.
     try std.testing.expectEqual(d.id, (try duplicate(&db, &run, "https://x.y/a.bin", "/tmp/b.bin")).?.id);
@@ -291,6 +314,7 @@ test "a file from before `headers` and `named` gets both columns on open" {
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expect(rows[0].headers == null);
     try std.testing.expect(!rows[0].named);
+    try std.testing.expect(rows[0].sha256 == null);
     // And a second open finds them there and adds nothing.
     var again = try open(std.testing.allocator, io, uri);
     defer again.deinit();

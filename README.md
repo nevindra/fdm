@@ -40,8 +40,10 @@ person watching a download on the other two.
 ## Use
 
 ```
-fdm [url ...] [-o path] [-H header] [--dir path] [--batch file] [--force]
-    [-n segments] [-p parallel] [--stall ms] [--retries n] [--db file] [--headless] [--json]
+fdm [url ...] [-o path] [-H header] [--sha256 hex] [--dir path] [--batch file] [--force]
+    [-n segments] [-p parallel] [--stall ms] [--retries n] [--retry-wait ms] [--auto-resume]
+    [--db file] [--headless] [--json]
+fdm refresh <id> <url> [-H header] [--headless] [--json]
 fdm ls [--json]
 ```
 
@@ -53,19 +55,26 @@ are read, and the rest of curl's options are skipped.
 |---|---|---|
 | `-o` | | where the n-th URL goes: a file, or a directory when it ends in `/` or is one |
 | `-H` | | a `Name: value` sent with every request for these URLs; repeatable. `Authorization`, `Host` and `User-Agent` go where `std.http` wants them |
+| `--sha256` | | what the n-th URL's file must hash to; a mismatch fails it and keeps the file |
 | `--dir` | the cwd | where a URL without `-o` lands |
-| `--batch` | | a file with one URL, or one `curl` line, per line; `#` comments, `\` continues a line |
+| `--batch` | | a file with one URL, or one `curl` line, per line; `#` comments, `\` continues a line, `url sha256=<hex>` |
 | `--force` | | add a URL that is already in the list, or whose file is |
 | `-n` | 16 | connections per download |
 | `-p` | 3 | downloads running at once; the rest queue |
 | `--stall` | 10000 | ms a segment may go without a byte before it is reconnected |
 | `--retries` | 3 | attempts per segment, and per probe, before the download fails |
+| `--retry-wait` | 0 | ms a failed segment waits before its next attempt |
+| `--auto-resume` | | at start, queue the paused downloads too |
 | `--db` | `$XDG_DATA_HOME/fdm/fdm.db` | the list, the segments and the queue |
 | `--headless` | | no screen; one line per event, exit when the URLs given are done — non-zero if one failed or was a duplicate |
 | `--json` | | each `--headless` line, and `fdm ls`, as JSON |
 
-`fdm ls` prints the list without starting anything; `fdm update` and
-`fdm --version` are the other two subcommands.
+`fdm refresh <id> <url>` gives a paused or failed download a new link — a
+signed URL that expired, a mirror that went away — and queues it; the
+file and its segments stay, and if the new server says it is the same
+object the download carries on from where it was. A pasted `curl` line
+brings its headers with it. `fdm ls` prints the list without starting
+anything; `fdm update` and `fdm --version` are the other two.
 
 In the terminal:
 
@@ -74,6 +83,7 @@ In the terminal:
 | `a` | add a URL, or paste a `curl` line |
 | `p` | pause the selected download |
 | `r` | resume a paused or failed one |
+| `u` | give it a new URL first |
 | `d` | delete it, asking whether the file goes too |
 | `tab` | cycle the filter: all, running, queued, done, failed |
 | `/` | search |
@@ -85,7 +95,10 @@ path segment — unless the server's `Content-Disposition` names it, which
 wins over a name like `download` or a hash, or `-o` does, which wins over
 both. The file's modification time is the server's `Last-Modified`, so an
 archive sorts where it was published. A URL already in the list, or a
-path already taken, is refused with a prompt (`--force` in a script).
+path already taken, is refused with a prompt (`--force` in a script). A
+file that will not fit is refused before a byte lands, and a disk that
+fills mid-file fails the download at once rather than three retries
+later, with its progress written for when there is room.
 Two panes at 100 columns or wider: the list on the left; the network
 graph, the selected download's URL, path, ETA, one bar per segment and
 its log on the right. `std.log` goes to `<db>.log`, never the terminal.
@@ -134,6 +147,7 @@ second and nothing can be won. Where a host caps a connection
 | `src/dns.zig` | the worker's Io with one vtable slot swapped: a host is resolved once a download |
 | `src/tui.zig` | the terminal front: `Item` is the model, `Model.apply` is `update`, `draw` is the view |
 | `src/curl.zig` | a pasted `curl` line, or a URL, into one `Add` |
+| `src/disk.zig` | how much room a directory's filesystem has, on each platform |
 | `src/theme.zig` | every colour, in one place |
 | `src/update.zig` | `fdm update`: the latest release, checked against its `sha256sums.txt`, renamed over this binary |
 | `src/main.zig` | wiring, the flags, `--headless`, `fdm ls`, and where the database lives on each platform |

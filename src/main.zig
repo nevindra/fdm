@@ -1,9 +1,10 @@
 //! fdm — fast download manager.
 //!
 //! ```
-//! fdm [url ...] [-o path] [-H header] [--dir path] [--batch file] [--force]
-//!     [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file]
-//!     [--headless] [--json]
+//! fdm [url ...] [-o path] [-H header] [--sha256 hex] [--dir path] [--batch file] [--force]
+//!     [-p parallel] [-n segments] [--stall ms] [--retries n] [--retry-wait ms]
+//!     [--auto-resume] [--db file] [--headless] [--json]
+//! fdm refresh <id> <url> [-H header] [--headless] [--json] [--db file]
 //! fdm ls [--json] [--db file]
 //! ```
 //!
@@ -65,12 +66,14 @@ pub fn main(init: std.process.Init) !void {
     var settings: download.Settings = .{};
     var adds: std.ArrayList(download.Add) = .empty;
     var outs: std.ArrayList([]const u8) = .empty;
+    var sums: std.ArrayList([]const u8) = .empty;
     var headers: std.ArrayList([]const u8) = .empty;
     var db_path: ?[]const u8 = null;
     var headless = false;
     var json = false;
     var force = false;
     var listing = false;
+    var refresh_id: ?i64 = null;
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--version")) {
         std.debug.print("fdm {s}\n", .{update.version});
@@ -82,10 +85,14 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "ls")) {
         listing = true;
         i = 2;
+    } else if (args.len > 1 and std.mem.eql(u8, args[1], "refresh")) {
+        if (args.len < 4) return usage();
+        refresh_id = std.fmt.parseInt(i64, args[2], 10) catch return usage();
+        i = 3;
     }
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (isOne(a, &.{ "-n", "-p", "--stall", "--retries", "--db", "-o", "-H", "--header", "--dir", "--batch" })) {
+        if (isOne(a, &.{ "-n", "-p", "--stall", "--retries", "--retry-wait", "--db", "-o", "-H", "--header", "--sha256", "--dir", "--batch" })) {
             if (i + 1 >= args.len) return usage();
             const v = args[i + 1];
             i += 1;
@@ -97,6 +104,11 @@ pub fn main(init: std.process.Init) !void {
                 settings.stall_ms = std.fmt.parseInt(u32, v, 10) catch return usage();
             } else if (std.mem.eql(u8, a, "--retries")) {
                 settings.retries = std.fmt.parseInt(u8, v, 10) catch return usage();
+            } else if (std.mem.eql(u8, a, "--retry-wait")) {
+                settings.retry_wait_ms = std.fmt.parseInt(u32, v, 10) catch return usage();
+            } else if (std.mem.eql(u8, a, "--sha256")) {
+                if (!isSha256Hex(v)) return usage();
+                try sums.append(arena, v);
             } else if (std.mem.eql(u8, a, "-o")) {
                 if (v.len == 0) return usage();
                 try outs.append(arena, v);
@@ -117,6 +129,8 @@ pub fn main(init: std.process.Init) !void {
             json = true;
         } else if (std.mem.eql(u8, a, "--force")) {
             force = true;
+        } else if (std.mem.eql(u8, a, "--auto-resume")) {
+            settings.auto_resume = true;
         } else if (a.len > 0 and a[0] == '-') {
             return usage();
         } else try adds.append(arena, try curl.parse(arena, a));
@@ -124,12 +138,14 @@ pub fn main(init: std.process.Init) !void {
     if (settings.segments == 0 or settings.parallel == 0) return usage();
     // The n-th `-o` goes with the n-th URL, as curl pairs them; one more
     // `-o` than URLs is a mistake.
-    if (outs.items.len > adds.items.len) return usage();
+    if (outs.items.len > adds.items.len or sums.items.len > adds.items.len) return usage();
     for (adds.items, 0..) |*a, n| {
         if (n < outs.items.len) a.out = outs.items[n];
+        if (n < sums.items.len) a.sha256 = sums.items[n];
         if (headers.items.len > 0 and a.headers.len == 0) a.headers = headers.items;
         a.force = force;
     }
+    if (refresh_id != null and adds.items.len != 1) return usage();
 
     const db = db_path orelse try defaultDbPath(arena, init.environ_map);
     if (listing) return list(arena, init.io, db, json);
@@ -139,8 +155,19 @@ pub fn main(init: std.process.Init) !void {
     defer worker.stop();
     openLog(init.io, arena, db);
 
-    if (headless) return runHeadless(gpa, init.io, worker, adds.items, json);
+    if (refresh_id) |id| {
+        try worker.send(.{ .refresh = .{ .id = id, .add = try adds.items[0].dupe(worker.gpa) } });
+        if (headless) return runHeadless(gpa, init.io, worker, &.{}, id, json);
+        return tui.run(gpa, init.io, init.environ_map, worker, &.{});
+    }
+    if (headless) return runHeadless(gpa, init.io, worker, adds.items, null, json);
     try tui.run(gpa, init.io, init.environ_map, worker, adds.items);
+}
+
+fn isSha256Hex(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
 }
 
 fn isOne(word: []const u8, of: []const []const u8) bool {
@@ -150,7 +177,9 @@ fn isOne(word: []const u8, of: []const []const u8) bool {
 
 /// One URL — or one `curl` line — per line; blank lines and `#` comments
 /// are skipped. A line ending in `\` continues on the next, so a pasted
-/// `curl` command keeps the shape the browser gave it.
+/// `curl` command keeps the shape the browser gave it. A URL may be
+/// followed by `sha256=<hex>`, which is how a sums file reads once the
+/// two columns are swapped.
 fn readBatch(arena: std.mem.Allocator, io: std.Io, path: []const u8, adds: *std.ArrayList(download.Add)) !void {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20));
     var entry: std.ArrayList(u8) = .empty;
@@ -167,10 +196,30 @@ fn readBatch(arena: std.mem.Allocator, io: std.Io, path: []const u8, adds: *std.
             continue;
         }
         try entry.appendSlice(arena, line_text);
-        try adds.append(arena, try curl.parse(arena, entry.items));
+        try adds.append(arena, parseBatchLine(arena, entry.items) catch return badLine(path, lines.index orelse text.len, text));
         entry = .empty;
     }
-    if (std.mem.trim(u8, entry.items, " \t").len > 0) try adds.append(arena, try curl.parse(arena, entry.items));
+    if (std.mem.trim(u8, entry.items, " \t").len > 0) try adds.append(arena, parseBatchLine(arena, entry.items) catch return badLine(path, text.len, text));
+}
+
+/// Which line, by counting newlines up to where the splitter is.
+fn badLine(path: []const u8, at: usize, text: []const u8) error{Usage} {
+    const n = std.mem.count(u8, text[0..at], "\n");
+    std.debug.print("{s}:{d}: not a URL, a curl line, or `url sha256=<hex>`\n", .{ path, n });
+    return error.Usage;
+}
+
+fn parseBatchLine(arena: std.mem.Allocator, entry: []const u8) !download.Add {
+    const trimmed = std.mem.trim(u8, entry, " \t");
+    if (std.mem.startsWith(u8, trimmed, "curl")) return curl.parse(arena, trimmed);
+    var words = std.mem.tokenizeAny(u8, trimmed, " \t");
+    var a: download.Add = .{ .url = words.next() orelse return error.NoUrl };
+    while (words.next()) |word| {
+        if (std.mem.startsWith(u8, word, "sha256=") and isSha256Hex(word[7..])) {
+            a.sha256 = word[7..];
+        } else return error.BadBatchLine;
+    }
+    return a;
 }
 
 /// `fdm ls`: every row, as a line or as one JSON array, and nothing
@@ -187,9 +236,7 @@ fn list(arena: std.mem.Allocator, io: std.Io, db_path: []const u8, json: bool) !
     var lines: std.ArrayList(Line) = .empty;
     for (rows) |row| {
         var bytes: i64 = 0;
-        if (row.state == .done) {
-            bytes = row.total orelse 0;
-        } else for (try store.segmentsOf(&db, &run, row.id)) |seg| bytes += seg.done;
+        for (try store.segmentsOf(&db, &run, row.id)) |seg| bytes += seg.done;
         try lines.append(arena, .{ .id = row.id, .state = row.state, .name = row.name, .path = row.path, .url = row.url, .total = row.total, .bytes = bytes });
     }
 
@@ -212,11 +259,16 @@ fn list(arena: std.mem.Allocator, io: std.Io, db_path: []const u8, json: bool) !
 /// process ends when the last of them is done or failed. Rows restored
 /// from the database are reported but not waited for; a URL refused as a
 /// duplicate counts as failed, so the exit says so.
-fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, adds: []const download.Add, json: bool) !void {
+fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, adds: []const download.Add, also: ?i64, json: bool) !void {
     var waiting: std.ArrayList(i64) = .empty;
     defer waiting.deinit(gpa);
     var pending: usize = adds.len;
     for (adds) |a| try worker.send(.{ .add = try a.dupe(worker.gpa) });
+    // A `refresh` names its row up front.
+    if (also) |id| {
+        try waiting.append(gpa, id);
+        pending += 1;
+    }
 
     var failed = false;
     var last_line_ms: i64 = 0;
@@ -226,7 +278,7 @@ fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, add
         const events = try worker.take();
         defer gpa.free(events);
         for (events) |ev| switch (ev) {
-            .added => |a| if (a.state == .queued and waiting.items.len < adds.len and isOurs(adds, a.url.slice())) {
+            .added => |a| if (a.state == .queued and !isWaited(waiting.items, a.id) and isOurs(adds, a.url.slice())) {
                 try waiting.append(gpa, a.id);
                 line(json, .{ .event = "added", .id = a.id, .url = a.url.slice(), .path = a.path.slice() }, "{d}: {s} -> {s}", .{ a.id, a.url.slice(), a.path.slice() });
             },
@@ -235,7 +287,6 @@ fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, add
                 last_line_ms = now;
                 line(json, .{ .event = "progress", .id = p.id, .bytes = p.bytes }, "{d}: {d} bytes", .{ p.id, p.bytes });
             },
-            .note => |n| line(json, .{ .event = "note", .id = n.id, .text = n.text.slice() }, "{d}: {s}", .{ n.id, n.text.slice() }),
             .done => |d| {
                 line(json, .{ .event = "done", .id = d.id, .bytes = d.bytes, .elapsed_ms = d.elapsed_ms }, "{d}: done, {d} bytes in {d} ms", .{ d.id, d.bytes, d.elapsed_ms });
                 if (isWaited(waiting.items, d.id)) pending -= 1;
@@ -252,6 +303,15 @@ fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, add
                 pending -= 1;
                 failed = true;
             },
+            .refreshed => |r| line(json, .{ .event = "refreshed", .id = r.id, .url = r.url.slice() }, "{d}: now {s}", .{ r.id, r.url.slice() }),
+            .refused => |r| {
+                line(json, .{ .event = "refused", .id = r.id, .text = r.text.slice() }, "{d}: {s}", .{ r.id, r.text.slice() });
+                if (isWaited(waiting.items, r.id)) {
+                    pending -= 1;
+                    failed = true;
+                }
+            },
+            .note => |n| line(json, .{ .event = "note", .id = n.id, .text = n.text.slice() }, "{d}: {s}", .{ n.id, n.text.slice() }),
             .fatal => |t| {
                 line(json, .{ .event = "fatal", .text = t.slice() }, "fatal: {s}", .{t.slice()});
                 return error.Fatal;
@@ -304,8 +364,10 @@ fn defaultDbPath(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]con
 
 fn usage() error{Usage} {
     std.debug.print(
-        \\usage: fdm [url ...] [-o path] [-H header] [--dir path] [--batch file] [--force]
-        \\           [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file] [--headless] [--json]
+        \\usage: fdm [url ...] [-o path] [-H header] [--sha256 hex] [--dir path] [--batch file] [--force]
+        \\           [-p parallel] [-n segments] [--stall ms] [--retries n] [--retry-wait ms] [--auto-resume]
+        \\           [--db file] [--headless] [--json]
+        \\       fdm refresh <id> <url> [-H header] [--headless] [--json] [--db file]
         \\       fdm ls [--json] [--db file]
         \\       fdm update | fdm --version
         \\
@@ -316,6 +378,7 @@ fn usage() error{Usage} {
 test {
     _ = download;
     _ = curl;
+    _ = @import("disk.zig");
     _ = tui;
     _ = @import("store.zig");
     _ = @import("dns.zig");

@@ -136,6 +136,8 @@ pub const Model = struct {
     filter: Filter = .all,
     /// The URL being typed after `a`, or null when nothing is.
     input: ?std.ArrayList(u8) = null,
+    /// When `input` is a new URL for a row rather than a new row: `u`.
+    input_for: ?i64 = null,
     /// The search box: typing when `searching`, and a filter when not.
     search: std.ArrayList(u8) = .empty,
     searching: bool = false,
@@ -308,6 +310,14 @@ pub const Model = struct {
                 if (m.dup) |old| old.add.free(m.gpa);
                 m.dup = .{ .of = dup.of, .add = sent };
             },
+            .refreshed => |r| if (m.find(r.id)) |it| {
+                it.url = r.url;
+                it.pushLog(now, .from("new URL"));
+            },
+            .refused => |r| {
+                m.say(now, r.text);
+                if (m.find(r.id)) |it| it.pushLog(now, r.text);
+            },
             .fatal => |t| m.status = t,
         }
     }
@@ -414,6 +424,20 @@ fn add(m: *Model, worker: *download.Worker, line: []const u8, now: i64) !void {
     try send(m, worker, parsed);
 }
 
+/// A new URL — or a pasted `curl` line, whose headers replace the row's —
+/// for a row that is paused or failed.
+fn refresh(m: *Model, worker: *download.Worker, id: i64, line: []const u8, now: i64) !void {
+    if (std.mem.trim(u8, line, " \t\r\n").len == 0) return;
+    const parsed = curl.parse(m.gpa, line) catch |err| {
+        m.say(now, .fmt("not refreshed: {t}", .{err}));
+        return;
+    };
+    defer parsed.free(m.gpa);
+    const owned = try parsed.dupe(worker.gpa);
+    errdefer owned.free(worker.gpa);
+    try worker.send(.{ .refresh = .{ .id = id, .add = owned } });
+}
+
 /// One copy to the worker, which frees it; one kept, for a `duplicate`.
 fn send(m: *Model, worker: *download.Worker, a: download.Add) !void {
     const kept = try a.dupe(m.gpa);
@@ -435,10 +459,13 @@ fn handleKey(m: *Model, worker: *download.Worker, key: vaxis.Key, now: i64) !boo
             defer m.gpa.free(url);
             in.deinit(m.gpa);
             m.input = null;
-            try add(m, worker, url, now);
+            const for_id = m.input_for;
+            m.input_for = null;
+            if (for_id) |id| try refresh(m, worker, id, url, now) else try add(m, worker, url, now);
         } else if (key.matches(vaxis.Key.escape, .{})) {
             in.deinit(m.gpa);
             m.input = null;
+            m.input_for = null;
         } else if (key.matches(vaxis.Key.backspace, .{})) {
             _ = in.pop();
         } else if (key.matches('u', .{ .ctrl = true })) {
@@ -510,6 +537,11 @@ fn handleKey(m: *Model, worker: *download.Worker, key: vaxis.Key, now: i64) !boo
             if (it.state == .running or it.state == .queued) try worker.send(.{ .cancel = it.id });
         } else if (key.matches('r', .{})) {
             if (it.state == .failed or it.state == .cancelled) try worker.send(.{ .restart = it.id });
+        } else if (key.matches('u', .{})) {
+            if (it.state == .failed or it.state == .cancelled) {
+                m.input = .empty;
+                m.input_for = it.id;
+            } else m.say(now, .from("Pause it first, then u"));
         } else if (key.matches('d', .{})) {
             m.confirm = it.id;
         }
@@ -539,7 +571,7 @@ fn draw(m: *Model, root: vaxis.Window, now: i64) void {
     }
     drawHelp(m, root.child(.{ .y_off = h - 1, .height = 1 }), now);
 
-    if (m.input) |in| drawInput(root, in.items);
+    if (m.input) |in| drawInput(root, in.items, m.input_for);
     if (m.confirm) |id| if (m.find(id)) |it| drawConfirm(root, it);
     if (m.dup) |dup| drawDuplicate(root, m.find(dup.of), dup.add.url);
 }
@@ -761,7 +793,7 @@ fn drawDetails(m: *Model, win: vaxis.Window, now: i64) void {
 
 fn drawHelp(m: *Model, win: vaxis.Window, now: i64) void {
     const keys = [_][2][]const u8{
-        .{ "a", "add" },      .{ "p", "pause" },  .{ "r", "resume" }, .{ "d", "delete" },
+        .{ "a", "add" },      .{ "p", "pause" },  .{ "r", "resume" }, .{ "u", "new url" }, .{ "d", "delete" },
         .{ "tab", "filter" }, .{ "/", "search" },
         .{ "↑↓", "move" },
         .{ "q", "quit" },
@@ -779,12 +811,13 @@ fn drawHelp(m: *Model, win: vaxis.Window, now: i64) void {
     }
 }
 
-fn drawInput(root: vaxis.Window, text: []const u8) void {
+fn drawInput(root: vaxis.Window, text: []const u8, for_id: ?i64) void {
     const w: u16 = @min(root.width -| 4, 90);
     const box = root.child(.{ .x_off = (root.width - w) / 2, .y_off = root.height / 2 - 2, .width = w, .height = 3 });
     box.fill(.{ .style = .{ .bg = theme.bg_alt } });
     const inner = box.child(.{ .border = .{ .where = .all, .style = theme.border_focus, .glyphs = .single_rounded } });
-    _ = box.printSegment(.{ .text = " Add URL ", .style = theme.title }, .{ .col_offset = 2, .wrap = .none });
+    const title = if (for_id) |id| txt(" New URL for #{d} ", .{id}) else " Add URL ";
+    _ = box.printSegment(.{ .text = title, .style = theme.title }, .{ .col_offset = 2, .wrap = .none });
     // Show the tail when it is longer than the box.
     const room: usize = inner.width -| 3;
     const shown = txt("{s}", .{if (text.len > room) text[text.len - room ..] else text});

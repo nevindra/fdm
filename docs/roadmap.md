@@ -18,15 +18,17 @@ thing it is a strong signal the thing is wanted. What fdm already has
 (sixteen connections, the 0.3× mean reconnect, the steal, resume on
 `ETag`, the `nilo_job` queue, `--headless`, `fdm update`, headers and a
 pasted `curl` line, `-o` and `--dir` and the server's name, the refused
-duplicate, `--batch` and `--json` and `fdm ls`, the remote mtime) is not
-listed.
+duplicate, `--batch` and `--json` and `fdm ls`, the remote mtime,
+`--sha256`, `refresh`, the disk check and `ENOSPC` as final,
+`--auto-resume`, `--retry-wait`) is not listed.
 
 ## Next: cheap, and the shape of the program does not move
 
 Each of these lands in `store.zig` and `download.zig`, or in `main.zig`'s
-flag parsing, and nothing else has to change. The first batch of them
-did — headers, `-o`, the duplicate, `--batch`/`--json`, the mtime — and
-what that cost is in `history.md`; `Add` now carries what the person
+flag parsing, and nothing else has to change. Two batches of them did —
+headers, `-o`, the duplicate, `--batch`/`--json`, the mtime; then
+`--sha256`, `refresh`, the disk check, `--auto-resume`, `--retry-wait` —
+and what they cost is in `history.md`; `Add` now carries what the person
 asked for, so the next per-download option is a field on it.
 
 **A rate limit, per download and global.** *Surge `surge limit <id>
@@ -37,36 +39,6 @@ the worker. `--limit 2M` on the command line and `l` in the TUI. Costs:
 one atomic and one clock read per chunk, and nothing when the limit is
 zero.
 
-**`refresh <id> <url>`: a new URL for a paused or failed download.**
-*Surge.* Signed URLs expire and mirrors go away, and today the answer is
-delete and start over. Resume already asks the server before continuing
-and compares `ETag` and length; the same check against a new URL is what
-makes this safe, and if it disagrees, the download starts over on the
-new link rather than stitching two files. Costs: one `Command`, one
-`UPDATE`.
-
-**Disk space checked at probe, and `ENOSPC` handled as final.** *Surge
-`orchestrator/disk_precheck`, `scheduler/enospc_policy`.* The probe
-knows the length; `statvfs` on the target directory knows the space.
-Refusing at add time is one comparison. And a segment that hits
-`ENOSPC` mid-file is today retried three times against the same full
-disk, then a steal hands it more work; Surge's rule is the right one:
-fail at once, no retry, no steal, no mirror, write the state so resume
-carries on once there is room. Costs: nothing per byte.
-
-**A checksum, verified at the end.** *aria2 `--checksum
-sha-256=…`.* Release pages ship a sums file next to the binary and
-nobody checks it by hand. `--sha256 <hex>` on add, hashed while the
-segments are written or in one pass at the end, and a mismatch is a
-failure with the file kept for inspection. `fdm update` already does
-exactly this for itself (`update.zig`); the same code, opened to any
-download. Costs: one hash pass over the file, which is disk-bound and
-after the network is done.
-
-**Auto-resume on start, opt-in.** *Surge `auto_resume`.* Running
-downloads already resume on the next start; paused ones stay paused,
-which is right, but a config flag that resumes those too is what a
-person who quit to reboot wants. Costs: one query at start.
 
 ## Weighed: worth building, and each needs a design first
 
@@ -123,12 +95,12 @@ thread, after the file is closed.
 D-Bus call; one file per platform, like `main.zig`'s database path.
 Costs: one process or one D-Bus connection held open.
 
-**Retry with a wait, and a resume that gives up.** *aria2
-`--retry-wait`, `--max-resume-failure-tries`, `--always-resume=false`.*
-The queue already backs off a whole download; a segment's three tries
-are back to back. And a server that answered 206 at the probe and 200
-on resume is today a fresh start every time, forever. Both are numbers
-in `Options` rather than designs.
+**A resume that gives up.** *aria2 `--max-resume-failure-tries`,
+`--always-resume=false`.* A server that answered 206 at the probe and
+200 on resume is today a fresh start every time, forever. What "giving
+up" should mean is not obvious — the fresh start is already the one
+stream the server allows — so this waits for a host that does it.
+`--retry-wait` shipped on its own.
 
 ## Refused, or not yet: they change what fdm is
 

@@ -40,6 +40,7 @@ const fetch = @import("nilo_fetch");
 const job = @import("nilo_job");
 const store = @import("store.zig");
 const dns = @import("dns.zig");
+const disk = @import("disk.zig");
 
 const Io = std.Io;
 
@@ -94,6 +95,13 @@ pub const Settings = struct {
     /// Where a download lands when `Add.out` does not say; null is the
     /// directory the process started in. Has to outlive the worker.
     dir: ?[]const u8 = null,
+    /// Milliseconds a failed segment waits before its next attempt. Zero
+    /// is back to back, which is right for a dropped connection and wrong
+    /// for a server that is briefly refusing everyone.
+    retry_wait_ms: u32 = 0,
+    /// At start, queue the downloads that were paused too — for a person
+    /// who quit to reboot rather than to stop.
+    auto_resume: bool = false,
 };
 
 /// One download as the person asked for it. The strings are allocated with
@@ -109,11 +117,15 @@ pub const Add = struct {
     out: ?[]const u8 = null,
     /// Queue it although a row with the same URL or path is in the list.
     force: bool = false,
+    /// Lowercase hex the finished file has to hash to; a mismatch is a
+    /// failure and the file is kept for looking at.
+    sha256: ?[]const u8 = null,
 
     pub fn dupe(a: Add, gpa: std.mem.Allocator) !Add {
         var copy: Add = .{ .url = try gpa.dupe(u8, a.url), .force = a.force };
         errdefer copy.free(gpa);
         if (a.out) |o| copy.out = try gpa.dupe(u8, o);
+        if (a.sha256) |h| copy.sha256 = try gpa.dupe(u8, h);
         const headers = try gpa.alloc([]const u8, a.headers.len);
         for (headers) |*h| h.* = "";
         copy.headers = headers;
@@ -124,6 +136,7 @@ pub const Add = struct {
     pub fn free(a: Add, gpa: std.mem.Allocator) void {
         gpa.free(a.url);
         if (a.out) |o| gpa.free(o);
+        if (a.sha256) |h| gpa.free(h);
         for (a.headers) |h| gpa.free(h);
         gpa.free(a.headers);
     }
@@ -136,6 +149,11 @@ pub const Command = union(enum) {
     /// Run a failed or cancelled download again — from where it got to, if
     /// the server still has the same file.
     restart: i64,
+    /// A new URL for a paused or failed download — a signed link that
+    /// expired, a mirror that went away — and then `restart`. The `Add`'s
+    /// headers replace the row's when there are any; its `out`, `force`
+    /// and `sha256` are ignored.
+    refresh: struct { id: i64, add: Add },
     /// Forget the row — and, when asked, the file on disk with it.
     delete: struct { id: i64, file: bool },
     quit,
@@ -169,6 +187,11 @@ pub const Event = union(enum) {
     /// Not added: row `of` already has this URL or this path. `Add.force`
     /// is the answer when it was meant.
     duplicate: struct { of: i64, url: Text },
+    /// The row's URL changed; `queued` follows.
+    refreshed: struct { id: i64, url: Text },
+    /// A `refresh` that could not be done — no such row, or one still
+    /// running. Nothing about the row changed.
+    refused: struct { id: i64, text: Text },
     /// The worker cannot run at all — the database would not open.
     fatal: Text,
 };
@@ -251,6 +274,7 @@ pub const Worker = struct {
     fn freeCommand(w: *Worker, c: Command) void {
         switch (c) {
             .add => |a| a.free(w.gpa),
+            .refresh => |r| r.add.free(w.gpa),
             else => {},
         }
     }
@@ -274,8 +298,9 @@ const Fetch = struct {
     /// a server that was down for a minute gets three more chances,
     /// spread out.
     pub const retry: job.Retry = .{ .times = 3, .backoff = .{ .exponential = .{ .from_ms = 2_000, .to_ms = 60_000 } } };
-    /// A 404 does not get better by waiting.
-    pub const final = error{BadStatus};
+    /// A 404 does not get better by waiting; nor does a full disk or a
+    /// file that hashed to the wrong thing.
+    pub const final = error{ BadStatus, NoSpaceLeft, ChecksumMismatch };
 
     download_id: i64,
 
@@ -395,6 +420,12 @@ fn threadMain(w: *Worker) void {
             .restart => |id| enqueue(&shared, &run, id) catch |err| {
                 w.post(.{ .failed = .{ .id = id, .text = .fmt("cannot queue: {t}", .{err}) } });
             },
+            .refresh => |r| {
+                defer w.freeCommand(cmd);
+                refresh(&shared, &run, r.id, r.add) catch |err| {
+                    w.post(.{ .refused = .{ .id = r.id, .text = .fmt("not refreshed: {t}", .{err}) } });
+                };
+            },
             .cancel => |id| {
                 // The row says cancelled either way; a job that has not
                 // been claimed yet reads that and does nothing. A running
@@ -442,7 +473,8 @@ fn restore(s: *Shared, run: *store.Run) void {
         if (store.segmentsOf(s.db, run, row.id)) |segs| {
             for (segs) |seg| bytes += @intCast(seg.done);
         } else |_| {}
-        const unfinished = row.state == .queued or row.state == .running;
+        const unfinished = row.state == .queued or row.state == .running or
+            (s.worker.settings.auto_resume and row.state == .cancelled);
         s.worker.post(.{ .added = .{
             .id = row.id,
             .url = .from(row.url),
@@ -473,7 +505,7 @@ fn insert(s: *Shared, run: *store.Run, a: Add) !void {
         return;
     };
     const headers: ?[]const u8 = if (a.headers.len == 0) null else try std.mem.join(arena, "\n", a.headers);
-    const row = try store.add(s.db, run, url, name, target.path, headers, target.named, nowMs(s.io));
+    const row = try store.add(s.db, run, url, name, target.path, headers, target.named, a.sha256, nowMs(s.io));
     s.worker.post(.{ .added = .{
         .id = row.id,
         .url = .from(url),
@@ -485,6 +517,20 @@ fn insert(s: *Shared, run: *store.Run, a: Add) !void {
         .segments = 0,
     } });
     try enqueue(s, run, row.id);
+}
+
+/// The row keeps its file, its segments and what the old server said the
+/// object was; only the link moves, and the next run's probe decides
+/// whether the new one has the same file. A running row is refused —
+/// pause it first — because its segments are on the old URL.
+fn refresh(s: *Shared, run: *store.Run, id: i64, a: Add) !void {
+    defer run.reset();
+    const row = (try s.db.find(store.Download, run, id)) orelse return error.NoSuchDownload;
+    if (row.state == .running or row.state == .queued) return error.StillRunning;
+    const headers: ?[]const u8 = if (a.headers.len == 0) null else try std.mem.join(run.arena(), "\n", a.headers);
+    try store.refresh(s.db, run, id, a.url, headers);
+    s.worker.post(.{ .refreshed = .{ .id = id, .url = .from(a.url) } });
+    try enqueue(s, run, id);
 }
 
 /// Where the file goes, absolute — a resume from another directory has to
@@ -602,6 +648,7 @@ const Download = struct {
         const stored_etag: ?Text = if (row.etag) |e| .from(e) else null;
         const header_lines = try gpa.dupe(u8, row.headers orelse "");
         defer gpa.free(header_lines);
+        const want_sha256: ?Text = if (row.sha256) |h| .from(h) else null;
         const headers = try Headers.parse(gpa, header_lines);
         defer headers.free(gpa);
 
@@ -669,6 +716,22 @@ const Download = struct {
         const resumable = segments.items.len > 0 and same_object and info.ranged and
             info.total != null and on_disk == info.total.?;
 
+        // One comparison before a byte lands: what is still to come
+        // against what the filesystem has. A disk that fills mid-file is
+        // caught below as `NoSpaceLeft`; this catches the one that was
+        // already too small, without three retries and a steal first.
+        if (info.total) |total| {
+            var have: u64 = 0;
+            if (resumable) for (segments.items) |seg| {
+                have += seg.have();
+            };
+            const need = total - @min(total, have);
+            if (disk.free(std.fs.path.dirname(path) orelse ".")) |room| if (room < need) {
+                d.why = .fmt("needs {d} MB, {d} MB free", .{ need >> 20, room >> 20 });
+                return error.NoSpaceLeft;
+            };
+        }
+
         const total = info.total;
         var ranged = false;
         if (resumable) {
@@ -684,10 +747,13 @@ const Download = struct {
 
             var starts: [256]i64 = undefined;
             var stops: [256]i64 = undefined;
+            // An unknown length is one segment to `maxInt(i64)` in the
+            // row — the column is signed — and `Segment.create` reads that
+            // back as the `maxInt(u64)` the task treats as "no end".
             for (0..count) |i| {
-                const per = if (total) |n| n / count else std.math.maxInt(u64);
+                const per = if (total) |n| n / count else 0;
                 starts[i] = @intCast(per * i);
-                stops[i] = @intCast(if (i + 1 == count) (total orelse std.math.maxInt(u64)) else per * (i + 1));
+                stops[i] = if (i + 1 == count) (if (total) |n| @intCast(n) else std.math.maxInt(i64)) else @intCast(per * (i + 1));
             }
             const rows = try store.plan(s.db, scope, d.id, if (total) |t| @intCast(t) else null, if (info.etag) |e| e.slice() else null, starts[0..count], stops[0..count]);
             for (segments.items) |seg| gpa.destroy(seg);
@@ -713,6 +779,14 @@ const Download = struct {
         var bytes: u64 = 0;
         for (segments.items) |seg| bytes += seg.have();
         if (total) |n| if (bytes != n) return error.ShortDownload;
+        if (want_sha256) |want| {
+            const got = try sha256Of(file, io);
+            if (!std.ascii.eqlIgnoreCase(want.slice(), &got)) {
+                d.why = .fmt("sha256 mismatch: got {s}", .{got});
+                return error.ChecksumMismatch;
+            }
+            w.post(.{ .note = .{ .id = d.id, .text = .from("sha256 verified") } });
+        }
         // The file's time is when it was published, not when it arrived —
         // so an archive sorts where it belongs. Not worth failing over.
         if (info.last_modified) |lm| if (parseHttpDate(lm.slice())) |secs| {
@@ -792,14 +866,23 @@ const Download = struct {
                             seg.future = null;
                         }
                         if (seg.state.load(.acquire) == .failed) {
+                            // A full disk is not a segment's fault, and
+                            // the next segment would only fill it more.
+                            if (seg.err == error.NoSpaceLeft) return seg.err;
                             seg.failures += 1;
+                            seg.wait_until_ms = now + settings.retry_wait_ms;
                             w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: attempt {d} failed: {t}", .{ seg.index, seg.attempts, seg.err }) } });
+                            seg.state.store(.idle, .release);
                         }
                         if (seg.failures > settings.retries) return seg.err;
                         // Nothing left to do — restored complete, or its
                         // remainder was taken.
                         if (seg.remaining() == 0) {
                             seg.state.store(.ok, .release);
+                            continue;
+                        }
+                        if (now < seg.wait_until_ms) {
+                            pending += 1;
                             continue;
                         }
                         seg.attempts += 1;
@@ -824,6 +907,7 @@ const Download = struct {
                             seg.future.?.cancel(io);
                             seg.future = null;
                             seg.failures += 1;
+                            seg.wait_until_ms = now + settings.retry_wait_ms;
                             w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: no bytes for {d}ms, cancelled and retrying", .{ seg.index, now - seg.last_moved_ms }) } });
                             seg.state.store(.idle, .release);
                         }
@@ -1066,6 +1150,8 @@ const Segment = struct {
     failures: u8 = 0,
     /// Reconnects for being slow, which count against nothing but a cap.
     restarts: u8 = 0,
+    /// Not before this, after a failure: `Settings.retry_wait_ms`.
+    wait_until_ms: i64 = 0,
     last_restart_ms: i64 = 0,
     future: ?Io.Future(void) = null,
     last_seen: u64 = 0,
@@ -1086,7 +1172,7 @@ const Segment = struct {
             .row_id = row.id,
             .index = @intCast(row.idx),
             .start = @intCast(row.start),
-            .end = .init(@intCast(row.stop)),
+            .end = .init(if (row.stop == std.math.maxInt(i64)) std.math.maxInt(u64) else @intCast(row.stop)),
             .done = .init(@intCast(row.done)),
             .saved = @intCast(row.done),
         };
@@ -1180,11 +1266,14 @@ const Segment = struct {
             if (want == 0) break;
             _ = reader.stream(&fw.interface, .limited64(want)) catch |err| switch (err) {
                 error.EndOfStream => break,
+                // The file's own error is the one worth reporting — a
+                // full disk is `NoSpaceLeft` there and `WriteFailed` here.
+                error.WriteFailed => return fw.err orelse err,
                 else => return err,
             };
             seg.done.store(fw.pos - seg.start, .monotonic);
         }
-        try fw.interface.flush();
+        fw.interface.flush() catch |err| return fw.err orelse err;
         seg.done.store(fw.pos - seg.start, .monotonic);
 
         if (seg.len()) |want| if (fw.pos - seg.start < want) return error.ShortBody;
@@ -1331,6 +1420,26 @@ fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
     const doy = @divFloor(153 * mp + 2, 5) + day - 1;
     const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
     return era * 146_097 + doe - 719_468;
+}
+
+// ---------------------------------------------------------------- verify
+
+/// The whole file, hashed from the front, as lowercase hex. One pass
+/// after the network is done, so it is disk-bound and costs nothing per
+/// byte received.
+fn sha256Of(file: Io.File, io: Io) ![64]u8 {
+    var buf: [64 << 10]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var at: u64 = 0;
+    while (true) {
+        const n = try file.readPositionalAll(io, &buf, at);
+        hasher.update(buf[0..n]);
+        at += n;
+        if (n < buf.len) break;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 // ------------------------------------------------------------------ misc

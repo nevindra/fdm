@@ -30,6 +30,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // `disk.zig` reads `sys/statvfs.h`; SQLite already brought libc.
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "nilo_core", .module = nilo.module("nilo_core") },
                 .{ .name = "nilo_fetch", .module = nilo.module("nilo_fetch") },
