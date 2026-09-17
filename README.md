@@ -1,18 +1,25 @@
 # fdm — fast download manager
 
-A download manager for Linux on [nilo](../nilo) and the
-[Native SDK](https://native-sdk.dev/). **MVP 3 is a terminal front over a
-worker that remembers and queues**; the window comes next, over the same
-worker.
+A download manager for Linux on [nilo](../nilo), with a terminal front on
+[libvaxis](https://github.com/rockorager/libvaxis). The worker is written
+so a [Native SDK](https://native-sdk.dev/) window could sit on it instead;
+for now the terminal is the product.
 
 ```
 zig build
 ./zig-out/bin/fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file]
 ```
 
-`a` adds a URL, `c` cancels the selected one, `r` resumes a failed or
-cancelled one, `j`/`k` move, `q` quits. Files land in the current
-directory under the URL's last path segment.
+`a` adds a URL, `p` pauses the selected download, `r` resumes a paused or
+failed one, `d` deletes it (asking whether the file goes too), `tab`
+cycles the filter, `/` searches, `j`/`k` or the arrows move, `q` quits.
+Files land in the current directory under the URL's last path segment.
+
+Two panes when the terminal is 100 columns or wider: the list with a tab
+per state on the left; the network graph, and the selected download's URL,
+path, ETA, one bar per segment and its own log on the right. The layout
+takes after [Surge](https://github.com/SurgeDM/Surge)'s dashboard; the
+palette is Tokyo Night and lives in `src/theme.zig`.
 
 **The list survives.** Every download is a row in one SQLite file
 (`--db`, default `$XDG_DATA_HOME/fdm/fdm.db`) and each segment's progress
@@ -37,7 +44,8 @@ the next start" is. `std.log` goes to `<db>.log`, never the terminal.
 |---|---|
 | `src/download.zig` | the worker: its own thread and `std.Io.Threaded`, one `fetch.Client`, every download a task with its segments under it. Talks to the rest through `Command` in and `Event` out, and knows nothing about a terminal or a window |
 | `src/store.zig` | the tables as structs — `downloads`, `segments`, and `nilo_job`'s own `nilo_jobs` — on `nilo_sql`'s SQLite wire with `.threading = .in_fiber`, and the statements the worker makes against them. `createMissing` builds them on first open |
-| `src/tui.zig` | the terminal front: `Item` is the model, `Model.apply` is `update`, `draw` is the view. Raw mode and a `poll` on stdin, no curses |
+| `src/tui.zig` | the terminal front on libvaxis: `Item` is the model, `Model.apply` is `update`, `draw` is the view. A tick thread posts into vaxis's queue ten times a second; that is when the worker's events are taken |
+| `src/theme.zig` | every colour, in one place |
 | `src/main.zig` | wiring |
 
 The seam between the two files is the point. A Native SDK app is
@@ -67,6 +75,15 @@ Against a local server that honours `Range` (`rangesrv.py`, 20 MB of
 | 4 segments, `Range` honoured | complete, hash matches, 4 attempts |
 | Server ignores `Range` (answers 200) | probe sees it, falls back to one stream, hash matches |
 | One segment stalls mid-body, socket held open, `--stall 3000` | watchdog fires at 3,003 ms, `Future.cancel` returns in **0 ms** with `ReadFailed`, segment resumes from its last written byte, hash matches, 5 attempts |
+
+**Two things libvaxis taught, both in comments where they bit.** The
+screen keeps the grapheme *slice* it is handed and `render` copies it, so
+a string formatted into a stack buffer is garbage by the time it is drawn
+— every string a frame prints now lives in an arena reset at the top of
+`draw`. And `Loop.stop` wakes its reader thread by asking the terminal
+for a device status report (`ESC[5n`); a pty with nobody answering hangs
+there forever, which is a property of the test harness rather than the
+program, and the harness now answers.
 
 Driven through a pty (`drive_tui*.py` in the session, not checked in):
 two URLs at once, a third typed in with `a`, `c` on one mid-flight, a

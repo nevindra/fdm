@@ -7,6 +7,10 @@
         // By path for now: the spike measures the working copy of nilo next
         // door rather than a published tag.
         .nilo = .{ .path = "../nilo" },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#f37c42a3b324131c131d066767968e1f5b976453",
+            .hash = "vaxis-0.6.0-BWNV_AIQDADLTDo5jCn27pBWJBvi-sTrSkSKwITQWgUV",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }

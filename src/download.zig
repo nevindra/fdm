@@ -91,6 +91,8 @@ pub const Command = union(enum) {
     /// Run a failed or cancelled download again — from where it got to, if
     /// the server still has the same file.
     restart: i64,
+    /// Forget the row — and, when asked, the file on disk with it.
+    delete: struct { id: i64, file: bool },
     quit,
 };
 
@@ -98,16 +100,21 @@ pub const Command = union(enum) {
 /// row in the database when the worker starts — then `started`, `progress`
 /// while it moves, `note` for anything a person would want to see, and
 /// exactly one of `done` / `failed` / `cancelled` at the end of each run.
+/// The most segments one download reports on individually. A download
+/// may have more; the rest are summed into `bytes`.
+pub const max_shown_segments = 16;
+
 pub const Event = union(enum) {
-    added: struct { id: i64, url: Text, name: Text, state: State, total: ?u64, bytes: u64, segments: u8 },
+    added: struct { id: i64, url: Text, name: Text, path: Text, state: State, total: ?u64, bytes: u64, segments: u8 },
     /// Waiting its turn — on `add`, `r`, and at start for what was unfinished.
     queued: struct { id: i64 },
     started: struct { id: i64, name: Text, total: ?u64, segments: u8, resumed: bool },
-    progress: struct { id: i64, bytes: u64 },
+    progress: struct { id: i64, bytes: u64, seg_done: [max_shown_segments]u64, seg_count: u8 },
     note: struct { id: i64, text: Text },
     done: struct { id: i64, bytes: u64, elapsed_ms: i64 },
     failed: struct { id: i64, text: Text },
     cancelled: struct { id: i64 },
+    removed: struct { id: i64 },
     /// The worker cannot run at all — the database would not open.
     fatal: Text,
 };
@@ -339,6 +346,18 @@ fn threadMain(w: *Worker) void {
                 run.reset();
                 if (!shared.cancelActive(id)) w.post(.{ .cancelled = .{ .id = id } });
             },
+            .delete => |del| {
+                // Stop it first if it is running; the task then finds no row
+                // to write its verdict into, which is fine. A queued job for
+                // it is dropped with the row, and one already claimed reads
+                // a missing row and returns.
+                _ = shared.cancelActive(del.id);
+                remove(&shared, &run, del.id, del.file) catch |err| {
+                    w.post(.{ .note = .{ .id = del.id, .text = .fmt("not deleted: {t}", .{err}) } });
+                    continue;
+                };
+                w.post(.{ .removed = .{ .id = del.id } });
+            },
             .quit => {
                 // The workers are cancelled mid-run: each task writes its
                 // progress down on the way out and hands its row back to
@@ -371,6 +390,7 @@ fn restore(s: *Shared, run: *store.Run) void {
             .id = row.id,
             .url = .from(row.url),
             .name = .from(row.name),
+            .path = .from(row.path),
             .state = if (unfinished) .queued else row.state,
             .total = if (row.total) |t| @intCast(t) else null,
             .bytes = bytes,
@@ -394,12 +414,24 @@ fn insert(s: *Shared, run: *store.Run, url: []const u8) !void {
         .id = row.id,
         .url = .from(url),
         .name = .from(name),
+        .path = .from(path),
         .state = .queued,
         .total = null,
         .bytes = 0,
         .segments = 0,
     } });
     try enqueue(s, run, row.id);
+}
+
+/// The row, its segments and its queued job go; the file only when asked.
+fn remove(s: *Shared, run: *store.Run, id: i64, file: bool) !void {
+    defer run.reset();
+    const row = (try s.db.find(store.Download, run, id)) orelse return;
+    if (file) Io.Dir.cwd().deleteFile(s.io, row.path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try store.remove(s.db, run, id);
 }
 
 /// One job per row: the key makes a second push while the first is queued
@@ -634,7 +666,9 @@ const Download = struct {
             if (pending == 0) return;
             if (bytes != last_reported) {
                 last_reported = bytes;
-                w.post(.{ .progress = .{ .id = d.id, .bytes = bytes } });
+                var seg_done: [max_shown_segments]u64 = @splat(0);
+                for (segments[0..@min(segments.len, max_shown_segments)], 0..) |*seg, i| seg_done[i] = seg.done.load(.monotonic);
+                w.post(.{ .progress = .{ .id = d.id, .bytes = bytes, .seg_done = seg_done, .seg_count = @intCast(@min(segments.len, max_shown_segments)) } });
             }
             if (now - last_saved_ms >= 1000) {
                 last_saved_ms = now;

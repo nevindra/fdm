@@ -137,6 +137,18 @@ pub fn plan(db: *Db, run: *Run, id: i64, total: ?i64, etag: ?[]const u8, starts:
     return rows;
 }
 
+/// The row, its segments, and any job still waiting to fetch it.
+pub fn remove(db: *Db, run: *Run, id: i64) !void {
+    var key: [32]u8 = undefined;
+    const unique = try std.fmt.bufPrint(&key, "dl:{d}", .{id});
+    var tx = try db.begin(run, .{});
+    errdefer tx.rollback();
+    _ = try tx.delete(Segment, run, .{ .where = .{ .download_id = id } });
+    _ = try tx.delete(JobTable.Row, run, .{ .where = .{ .unique_key = unique, .state = .queued } });
+    _ = try tx.delete(Download, run, .{ .where = .{ .id = id } });
+    try tx.commit();
+}
+
 pub fn saveDone(db: *Db, run: *Run, segment_id: i64, done: i64) !void {
     _ = try db.update(Segment, run, .{ .set = .{ .done = done }, .where = .{ .id = segment_id } });
 }

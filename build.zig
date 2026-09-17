@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     // The Fitting and the Service, no `nilo_http`: nothing here serves.
     // `.sql = true` is what fetches the SQLite driver (nilo's ADR 0075).
     const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .sql = true });
+    const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
 
     // SQLite links libc, and glibc 2.44's `crt1.o` carries an `.sframe`
     // section with relocations Zig 0.16's own ELF linker refuses
@@ -28,6 +29,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_fetch", .module = nilo.module("nilo_fetch") },
                 .{ .name = "nilo_job", .module = nilo.module("nilo_job") },
                 .{ .name = "nilo_sql", .module = nilo.module("nilo_sql") },
+                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             },
         }),
     });

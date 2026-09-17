@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
     defer worker.stop();
     openLog(arena, db);
 
-    try tui.run(gpa, worker, urls.items);
+    try tui.run(gpa, init.io, init.environ_map, worker, urls.items);
 }
 
 /// `$XDG_DATA_HOME/fdm/fdm.db`, or `~/.local/share/fdm/fdm.db`.
@@ -102,5 +102,6 @@ fn usage() error{Usage} {
 
 test {
     _ = download;
+    _ = tui;
     _ = @import("store.zig");
 }
