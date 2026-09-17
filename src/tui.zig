@@ -51,7 +51,7 @@ pub const Item = struct {
     note: Text = .{},
     elapsed_ms: i64 = 0,
     resumed: bool = false,
-    seg_done: [download.max_shown_segments]u64 = @splat(0),
+    seg: [download.max_shown_segments]download.SegView = @splat(.{ .len = 0, .done = 0 }),
     seg_count: u8 = 0,
     // The rate is sampled once a second from what `bytes` did meanwhile.
     rate_bytes: u64 = 0,
@@ -253,7 +253,7 @@ pub const Model = struct {
             .progress => |p| if (m.find(p.id)) |it| {
                 if (p.bytes > it.bytes) m.session_bytes += p.bytes - it.bytes;
                 it.bytes = p.bytes;
-                it.seg_done = p.seg_done;
+                it.seg = p.seg;
                 it.seg_count = p.seg_count;
             },
             .note => |n| if (m.find(n.id)) |it| {
@@ -664,7 +664,7 @@ fn drawDetails(m: *Model, win: vaxis.Window, now: i64) void {
     field(inner, row, "Size", size);
     row += 1;
     const st = switch (it.state) {
-        .running => txt("downloading · {s}/s · {d} segments{s}{s}", .{ human(it.rate), it.segments, if (it.etaSecs() != null) " · " else "", if (it.etaSecs()) |e| clock(e) else "" }),
+        .running => txt("downloading · {s}/s · {d} segments{s}{s}", .{ human(it.rate), if (it.seg_count > 0) it.seg_count else it.segments, if (it.etaSecs() != null) " · " else "", if (it.etaSecs()) |e| clock(e) else "" }),
         .done => "done",
         .failed => "failed",
         .cancelled => "paused",
@@ -681,20 +681,19 @@ fn drawDetails(m: *Model, win: vaxis.Window, now: i64) void {
     }
 
     if (it.seg_count > 0 and it.total != null and (it.state == .running or it.state == .cancelled)) {
-        _ = inner.printSegment(.{ .text = "Segments", .style = theme.muted }, .{ .row_offset = row, .wrap = .none });
+        _ = inner.printSegment(.{ .text = txt("Segments · {d}", .{it.seg_count}), .style = theme.muted }, .{ .row_offset = row, .wrap = .none });
         row += 1;
         const n: u16 = it.seg_count;
         const per_row: u16 = @min(n, 8);
         const cell_w: u16 = @max(4, inner.width / per_row);
         const bar_w = cell_w -| 1;
-        const seg_len: u64 = it.total.? / @as(u64, it.segments);
         var i: u16 = 0;
         while (i < n) : (i += 1) {
             const r = row + i / per_row;
             const c = (i % per_row) * cell_w;
-            const len = if (i + 1 == it.segments) it.total.? - seg_len * (it.segments - 1) else seg_len;
-            const f = if (len == 0) 1.0 else @as(f64, @floatFromInt(it.seg_done[i])) / @as(f64, @floatFromInt(len));
-            bar(inner, c, r, bar_w, f, if (f >= 1) theme.bar_done else theme.bar_fill, .{});
+            const sv = it.seg[i];
+            const fr = if (sv.len == 0) 1.0 else @as(f64, @floatFromInt(sv.done)) / @as(f64, @floatFromInt(sv.len));
+            bar(inner, c, r, bar_w, fr, if (fr >= 1) theme.bar_done else theme.bar_fill, .{});
         }
         row += (n + per_row - 1) / per_row + 1;
     }

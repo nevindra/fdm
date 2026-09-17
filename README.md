@@ -141,6 +141,35 @@ can before recording it. An unbuffered writer is not the answer:
 `std.Io.net`'s stream writes straight into the writer's buffer and asserts
 on an empty one.
 
+## Connections are not equal, and three things follow
+
+A CDN hands each connection to whichever edge it likes, and one of them
+is slow. Three answers, all in `Download.supervise`, and the first two
+are Surge's (their `OPTIMIZATIONS.md` says why):
+
+- **Sixteen connections a download** (`-n`), where the per-connection
+  ceiling most hosts apply stops being the limit and the pipe becomes it.
+- **A slow segment is reconnected.** Every second each running segment's
+  rate is sampled; every two seconds one that has run three seconds or
+  more and is under 0.3× the mean of the others — including the ones that
+  finished in the last ten seconds, so the last segment standing still has
+  a yardstick — is cancelled and resumes from where it was on a fresh
+  connection. Not a retry: it counts against a cap of four, not against
+  `--retries`.
+- **A finished segment takes half of what the longest running one has
+  left**, when that is 2 MB or more, so the download does not end at the
+  pace of its slowest connection. **The victim is not cancelled**: its
+  `end` is an atomic the task reads before every chunk, so it stops at the
+  new boundary and keeps its connection. The boundary goes half a megabyte
+  ahead of where the victim is; the split is one transaction in
+  `segments`, so a crash between the two rows leaves nothing uncovered.
+
+Against the test server with one connection made 20× slower (`--slow-one
+20`, 4 segments, 20 MB): before, the slow segment crawled alone for ~37 s
+after the others were done; after, a steal at 3 s and a reconnect at 3 s
+finish the whole file in **6.2 s**, sha256 matching, and `kill -9` in the
+middle of it resumes from the five-row table.
+
 ## What is still open
 
 - **Throughput against a fast peer** has not been measured: every run so

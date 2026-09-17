@@ -149,6 +149,24 @@ pub fn remove(db: *Db, run: *Run, id: i64) !void {
     try tx.commit();
 }
 
+/// Half of a running segment's remainder becomes a new one: the old row
+/// stops at `mid` and the new row runs from there to the old stop. One
+/// transaction, so a crash between the two leaves nothing uncovered.
+pub fn split(db: *Db, run: *Run, download_id: i64, victim_id: i64, mid: i64, idx: i32, old_stop: i64) !Segment {
+    var tx = try db.begin(run, .{});
+    errdefer tx.rollback();
+    _ = try tx.update(Segment, run, .{ .set = .{ .stop = mid }, .where = .{ .id = victim_id } });
+    const made = try tx.insert(Segment, run, .{
+        .download_id = download_id,
+        .idx = idx,
+        .start = mid,
+        .stop = old_stop,
+        .done = 0,
+    });
+    try tx.commit();
+    return made;
+}
+
 pub fn saveDone(db: *Db, run: *Run, segment_id: i64, done: i64) !void {
     _ = try db.update(Segment, run, .{ .set = .{ .done = done }, .where = .{ .id = segment_id } });
 }
