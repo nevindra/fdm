@@ -232,6 +232,17 @@ pub fn split(db: *Db, run: *Run, download_id: i64, victim_id: i64, mid: i64, idx
     return made;
 }
 
+/// One more segment, off the front of what no segment covers yet.
+pub fn extend(db: *Db, run: *Run, download_id: i64, idx: i32, start: i64, stop: i64) !Segment {
+    return db.insert(Segment, run, .{
+        .download_id = download_id,
+        .idx = idx,
+        .start = start,
+        .stop = stop,
+        .done = 0,
+    });
+}
+
 pub fn saveDone(db: *Db, run: *Run, segment_id: i64, done: i64) !void {
     _ = try db.update(Segment, run, .{ .set = .{ .done = done }, .where = .{ .id = segment_id } });
 }

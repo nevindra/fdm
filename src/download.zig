@@ -88,10 +88,19 @@ pub const Settings = struct {
     retries: u8 = 3,
     /// Below this, splitting costs more handshakes than it saves.
     min_segment: u64 = 1 << 20,
-    /// A running segment with at least this much left may have the second
-    /// half of it taken by a segment that has finished its own. Twice
-    /// `min_segment`, so that both halves are worth a connection.
-    steal_min: u64 = 2 << 20,
+    /// A connection that finished its chunk takes the next one sized to
+    /// this many seconds at the rate it just showed, so a slow connection
+    /// is never holding more than this much of the file and a fast one is
+    /// not asking every second. What each request costs is one round trip
+    /// idle, which at 200 ms is 2.5% of eight seconds.
+    chunk_secs: f64 = 8,
+    /// A running segment that needs at least this many seconds more at
+    /// its current rate may have the second half of what it has left taken
+    /// by a segment that has finished its own. Seconds rather than bytes,
+    /// because what a steal saves is time: half a megabyte on a connection
+    /// at 300 KB/s is worth a handshake, and four megabytes at 10 MB/s is
+    /// not.
+    steal_min_secs: f64 = 2,
     /// Where a download lands when `Add.out` does not say; null is the
     /// directory the process started in. Has to outlive the worker.
     dir: ?[]const u8 = null,
@@ -102,6 +111,14 @@ pub const Settings = struct {
     /// At start, queue the downloads that were paused too — for a person
     /// who quit to reboot rather than to stop.
     auto_resume: bool = false,
+    /// A running segment under this fraction of the others' mean rate is
+    /// reconnected. Zero turns the reconnect off.
+    slow_fraction: f64 = 0.3,
+    /// How many consecutive health checks (two seconds apart) a segment
+    /// has to be slow for before it is reconnected.
+    slow_checks: u8 = 1,
+    /// At most this many reconnects in one health check.
+    slow_per_check: u8 = 255,
 };
 
 /// One download as the person asked for it. The strings are allocated with
@@ -590,6 +607,56 @@ const Download = struct {
     /// A reason better than the error's name, when the code that failed
     /// had one — an HTTP status, say. Read once, by `runJob`.
     why: ?Text = null,
+    /// Where the part of the file no segment covers yet begins; `total`
+    /// once everything is handed out. The plan covers only the front, and
+    /// a connection that finishes its chunk takes the next from here —
+    /// so a slow connection holds a little and a fast one keeps going,
+    /// which is what a split by sixteen decided once cannot do. Only when
+    /// this reaches the end does a finished connection steal instead.
+    frontier: u64 = 0,
+    /// Length of the file, when known.
+    total: ?u64 = null,
+    /// The whole download's rate, one sample a second, the last ten kept:
+    /// what `reconnectSlow` reads to tell a link that is full from a
+    /// connection that is slow.
+    totals: [10]f64 = @splat(0),
+    totals_n: usize = 0,
+    total_rate: f64 = 0,
+    prev_total_rate: f64 = 0,
+    /// The last steal or reconnect, and the total then: two seconds later
+    /// the total is read again, and if it fell the link was the limit
+    /// after all — a burst allowance that ran out, a policer — and both
+    /// stop for ten seconds while the peak is forgotten.
+    acted_ms: i64 = 0,
+    acted_total: f64 = 0,
+    hold_until_ms: i64 = 0,
+
+    /// Whether adding or replacing a connection could carry more: the
+    /// download ran under 0.75× its usual second of the last ten, for two
+    /// seconds running — or under half of it, for one. On a shared link the total sits at the link's
+    /// rate however the connections divide it, and a new connection —
+    /// a steal, a reconnect — costs a handshake, discards what was in
+    /// flight, and moves nothing; on a 100 Mbit link with sixteen
+    /// connections that was five seconds in twenty. On a host that caps
+    /// each connection the total falls as segments finish or an edge
+    /// goes bad, and that is when both are worth their handshake.
+    fn linkHasRoom(d: *const Download, now: i64) bool {
+        if (now < d.hold_until_ms or d.totals_n < 3) return false;
+        const usual = d.usualRate();
+        return d.total_rate < 0.75 * usual and (d.prev_total_rate < 0.75 * usual or d.total_rate < 0.5 * usual);
+    }
+
+    /// The median second of the last ten: what the download usually
+    /// gets. Not the best one, because a burst allowance hands out one
+    /// second at ten times the rate that follows, and everything after
+    /// it would look like room.
+    fn usualRate(d: *const Download) f64 {
+        const n = @min(d.totals_n, d.totals.len);
+        var sorted: [10]f64 = undefined;
+        @memcpy(sorted[0..n], d.totals[0..n]);
+        std.mem.sort(f64, sorted[0..n], {}, std.sort.asc(f64));
+        return sorted[n / 2];
+    }
 
     /// What `Fetch.run` is. The verdict goes two places: the `downloads`
     /// row, for the list, and the return value, for the queue — which
@@ -745,15 +812,18 @@ const Download = struct {
                 1;
             ranged = info.ranged and count > 1;
 
+            // The first chunks cover a quarter of the file between them,
+            // a megabyte each at least; the rest is handed out as
+            // connections finish, sized to what each one showed. One
+            // segment when the server cannot slice, or the length is
+            // unknown — to `maxInt(i64)` in the row, the column being
+            // signed, which `Segment.create` reads back as "no end".
             var starts: [256]i64 = undefined;
             var stops: [256]i64 = undefined;
-            // An unknown length is one segment to `maxInt(i64)` in the
-            // row — the column is signed — and `Segment.create` reads that
-            // back as the `maxInt(u64)` the task treats as "no end".
+            const per: u64 = if (count == 1) 0 else @max(settings.min_segment, total.? / (count * 4));
             for (0..count) |i| {
-                const per = if (total) |n| n / count else 0;
                 starts[i] = @intCast(per * i);
-                stops[i] = if (i + 1 == count) (if (total) |n| @intCast(n) else std.math.maxInt(i64)) else @intCast(per * (i + 1));
+                stops[i] = if (count == 1) (if (total) |n| @intCast(n) else std.math.maxInt(i64)) else @intCast(@min(per * (i + 1), total.?));
             }
             const rows = try store.plan(s.db, scope, d.id, if (total) |t| @intCast(t) else null, if (info.etag) |e| e.slice() else null, starts[0..count], stops[0..count]);
             for (segments.items) |seg| gpa.destroy(seg);
@@ -762,6 +832,12 @@ const Download = struct {
             scope.reset();
             try file.setLength(io, total orelse 0);
         }
+        d.total = total;
+        d.frontier = if (total) |n| n else std.math.maxInt(u64);
+        if (ranged) for (segments.items) |seg| {
+            if (seg == segments.items[0]) d.frontier = 0;
+            d.frontier = @max(d.frontier, seg.end.load(.acquire));
+        };
 
         w.post(.{ .started = .{ .id = d.id, .name = name, .path = .from(path), .total = total, .segments = @intCast(segments.items.len), .resumed = resumable } });
 
@@ -811,7 +887,7 @@ const Download = struct {
     ///   connection — which as often as not lands on a different edge. Not
     ///   a failed attempt: it does not count towards `retries`.
     /// - **A finished segment takes half of what is left of the longest
-    ///   running one** when that is `steal_min` or more, so the download
+    ///   running one** when that would take `steal_min_secs` or more, so the download
     ///   does not end at the pace of its slowest connection. The victim is
     ///   not cancelled: its `end` is an atomic the task reads on every
     ///   chunk, so it stops at the new boundary and keeps its connection.
@@ -826,6 +902,7 @@ const Download = struct {
         const gpa = w.gpa;
         const settings = w.settings;
         var last_reported: u64 = std.math.maxInt(u64);
+        var last_sampled_bytes: u64 = 0;
         var last_saved_ms: i64 = nowMs(io);
         var last_sample_ms: i64 = last_saved_ms;
         var last_health_ms: i64 = last_saved_ms;
@@ -919,18 +996,49 @@ const Download = struct {
                 }
             }
 
+            // NextChunk: a free slot and file not yet handed out. Sized to
+            // `chunk_secs` at the rate the segment that just finished
+            // showed, which is the connection most likely to carry it.
+            while (ranged and running < settings.segments and d.frontier < d.total.?) {
+                try d.extend(scope, segments, now, file, url, headers);
+                pending += 1;
+                running += 1;
+            }
+
             if (pending == 0) return;
+
+            if (sampling) {
+                d.prev_total_rate = d.total_rate;
+                d.total_rate = @as(f64, @floatFromInt(bytes -| last_sampled_bytes));
+                last_sampled_bytes = bytes;
+                d.totals[d.totals_n % d.totals.len] = d.total_rate;
+                d.totals_n += 1;
+                // What the last action did to the total, once it has had
+                // two seconds to show.
+                if (d.acted_ms != 0 and now - d.acted_ms >= 2000) {
+                    if (d.total_rate < 0.85 * d.acted_total) {
+                        d.hold_until_ms = now + 10_000;
+                        d.totals_n = 0;
+                        w.post(.{ .note = .{ .id = d.id, .text = .fmt("{d} KB/s after the last reconnect or steal, {d} KB/s before: the link is the limit, holding", .{ @as(u64, @intFromFloat(d.total_rate / 1024)), @as(u64, @intFromFloat(d.acted_total / 1024)) }) } });
+                    }
+                    d.acted_ms = 0;
+                }
+            }
 
             // HealthCheck, every two seconds.
             if (now - last_health_ms >= 2000) {
                 last_health_ms = now;
-                d.reconnectSlow(segments.items, now);
+                if (d.linkHasRoom(now) and d.reconnectSlow(segments.items, now)) d.acted(now);
             }
 
-            // StealWork: a free slot, and somebody with enough left.
-            if (ranged and running < settings.segments) {
+            // StealWork: a free slot, nothing left to hand out, somebody
+            // with enough left, and a link with room for one more.
+            if (ranged and running < settings.segments and d.frontier >= d.total.? and d.linkHasRoom(now)) {
                 if (d.steal(scope, segments, now)) |made| {
-                    if (made) |seg| try segments.append(gpa, seg);
+                    if (made) |seg| {
+                        try segments.append(gpa, seg);
+                        d.acted(now);
+                    }
                 } else |err| {
                     w.post(.{ .note = .{ .id = d.id, .text = .fmt("steal failed: {t}", .{err}) } });
                 }
@@ -938,9 +1046,23 @@ const Download = struct {
 
             if (bytes != last_reported) {
                 last_reported = bytes;
+                // The running ones first, then the newest of the rest:
+                // with chunks handed out as connections finish there are
+                // more segments than bars, and the finished ones say least.
                 var view: [max_shown_segments]SegView = @splat(.{ .len = 0, .done = 0 });
-                const shown = @min(segments.items.len, max_shown_segments);
-                for (segments.items[0..shown], 0..) |seg, i| view[i] = .{ .len = seg.len() orelse 0, .done = seg.have() };
+                var shown: usize = 0;
+                for (segments.items) |seg| if (shown < max_shown_segments and seg.state.load(.acquire) == .running) {
+                    view[shown] = .{ .len = seg.len() orelse 0, .done = seg.have() };
+                    shown += 1;
+                };
+                var back = segments.items.len;
+                while (shown < max_shown_segments and back > 0) {
+                    back -= 1;
+                    const seg = segments.items[back];
+                    if (seg.state.load(.acquire) == .running) continue;
+                    view[shown] = .{ .len = seg.len() orelse 0, .done = seg.have() };
+                    shown += 1;
+                }
                 w.post(.{ .progress = .{ .id = d.id, .bytes = bytes, .seg = view, .seg_count = @intCast(shown) } });
             }
             if (now - last_saved_ms >= 1000) {
@@ -951,11 +1073,63 @@ const Download = struct {
         }
     }
 
+    /// One more segment off the frontier, started at once. The size is
+    /// what the connection that last finished did in `chunk_secs`, within
+    /// a megabyte and a sixteenth of the file — at the first, the plan's
+    /// own chunk.
+    fn extend(d: *Download, scope: *store.Run, segments: *std.ArrayList(*Segment), now: i64, file: Io.File, url: []const u8, headers: Headers) !void {
+        const s = d.shared;
+        const settings = s.worker.settings;
+        const total = d.total.?;
+        var rate: f64 = 0;
+        var latest: i64 = 0;
+        var first_len: u64 = 0;
+        for (segments.items) |seg| {
+            if (seg == segments.items[0]) first_len = seg.len() orelse 0;
+            if (seg.state.load(.acquire) == .ok and seg.finished_ms >= latest and seg.finished_ms > seg.started_ms) {
+                latest = seg.finished_ms;
+                rate = @as(f64, @floatFromInt(seg.have())) / (@as(f64, @floatFromInt(seg.finished_ms - seg.started_ms)) / 1000.0);
+            }
+        }
+        // Never more than a sixteenth of the file, nor of what is left to
+        // hand out — so the last chunks are small and the connections
+        // finish together rather than one of them last with eight
+        // seconds of work. A quarter of a megabyte at the least: a
+        // request's round trip is worth that much.
+        const unassigned = total - d.frontier;
+        const cap = @max(settings.min_segment, total / 16);
+        const want: u64 = if (rate > 0) @intFromFloat(rate * settings.chunk_secs) else first_len;
+        const size = @min(@max(256 << 10, @min(want, cap, unassigned / @as(u64, settings.segments))), unassigned);
+        const row = try store.extend(s.db, scope, d.id, @intCast(segments.items.len), @intCast(d.frontier), @intCast(d.frontier + size));
+        scope.reset();
+        const made = try Segment.create(s.worker.gpa, row);
+        errdefer s.worker.gpa.destroy(made);
+        try segments.append(s.worker.gpa, made);
+        d.frontier += size;
+        made.attempts = 1;
+        made.last_seen = 0;
+        made.last_moved_ms = now;
+        made.started_ms = now;
+        made.state.store(.running, .release);
+        made.future = try s.io.concurrent(Segment.run, .{ made, s.client, file, s.io, url, headers, true });
+    }
+
+    /// The first action of a burst is the one judged; the ones that follow
+    /// within two seconds are the same decision.
+    fn acted(d: *Download, now: i64) void {
+        if (d.acted_ms != 0) return;
+        d.acted_ms = now;
+        d.acted_total = d.total_rate;
+    }
+
     /// Cancel a running segment that is far behind the others, so its next
-    /// attempt gets a new connection. Bounded: not within five seconds of
+    /// attempt gets a new connection. True when one was. Bounded: not within five seconds of
     /// its last reconnect, not more than four times, and never one that has
     /// under a megabyte to go — that finishes sooner than it reconnects.
-    fn reconnectSlow(d: *Download, segments: []const *Segment, now: i64) void {
+    ///
+    /// Called only when `linkHasRoom`: on a shared link the one at
+    /// 80 KB/s is slow because the others are fast.
+    fn reconnectSlow(d: *Download, segments: []const *Segment, now: i64) bool {
         // The yardstick: every segment that ran for three seconds or more,
         // including ones that finished in the last ten — the last segment
         // standing has nothing else to be compared with.
@@ -970,14 +1144,27 @@ const Download = struct {
             sum += seg.rate;
             n += 1;
         }
-        if (n < 2) return;
+        if (n < 2) return false;
         const mean = sum / @as(f64, @floatFromInt(n));
-        if (mean <= 0) return;
+        if (mean <= 0) return false;
+        const settings = d.shared.worker.settings;
+        if (settings.slow_fraction <= 0) return false;
+        var reconnected: u8 = 0;
         for (segments) |seg| {
             if (seg.state.load(.acquire) != .running or now - seg.started_ms < 3000) continue;
-            if (seg.rate >= 0.3 * mean) continue;
-            if (seg.remaining() < (1 << 20)) continue;
+            if (seg.rate >= settings.slow_fraction * mean) {
+                seg.slow_checks = 0;
+                continue;
+            }
+            // Not one that finishes sooner than a reconnect would: under
+            // three seconds to go at the mean rate.
+            if (@as(f64, @floatFromInt(seg.remaining())) / mean < 3) continue;
             if (seg.restarts >= 4 or now - seg.last_restart_ms < 5000) continue;
+            seg.slow_checks +|= 1;
+            if (seg.slow_checks < settings.slow_checks) continue;
+            if (reconnected == settings.slow_per_check) break;
+            reconnected += 1;
+            seg.slow_checks = 0;
             seg.future.?.cancel(d.shared.io);
             seg.future = null;
             seg.restarts += 1;
@@ -985,35 +1172,59 @@ const Download = struct {
             seg.state.store(.idle, .release);
             d.shared.worker.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: {d} KB/s against {d} KB/s, reconnecting", .{ seg.index, @as(u64, @intFromFloat(seg.rate / 1024)), @as(u64, @intFromFloat(mean / 1024)) }) } });
         }
+        return reconnected > 0;
     }
 
     /// Give a new segment the second half of what the running segment with
     /// the most left still has to do, or null when nobody has enough.
     fn steal(d: *Download, scope: *store.Run, segments: *std.ArrayList(*Segment), now: i64) !?*Segment {
         const settings = d.shared.worker.settings;
+        // The victim is the one that would take longest to finish on its
+        // own, judged by its own rate — a connection at 300 KB/s with
+        // half a megabyte left is a worse place to be than one at 10 MB/s
+        // with four. A segment under two seconds old has no rate yet.
         var victim: ?*Segment = null;
+        var victim_secs: f64 = 0;
+        var rate_sum: f64 = 0;
+        var rate_n: f64 = 0;
         for (segments.items) |seg| {
-            if (seg.state.load(.acquire) != .running) continue;
-            if (seg.remaining() < settings.steal_min) continue;
-            if (victim == null or seg.remaining() > victim.?.remaining()) victim = seg;
+            if (seg.state.load(.acquire) != .running or now - seg.started_ms < 2000) continue;
+            rate_sum += seg.rate;
+            rate_n += 1;
+            const secs = @as(f64, @floatFromInt(seg.remaining())) / @max(seg.rate, 1);
+            if (secs < settings.steal_min_secs) continue;
+            if (victim == null or secs > victim_secs) {
+                victim = seg;
+                victim_secs = secs;
+            }
         }
         const v = victim orelse return null;
 
         // Ahead of the victim by a margin, so the boundary is still in
-        // front of it once written.
-        const margin: u64 = 512 << 10;
+        // front of it once written: a fifth of a second at its rate, and
+        // never under what one chunk holds.
+        const margin: u64 = @max(128 << 10, @as(u64, @intFromFloat(v.rate * 0.2)));
         const pos = v.start + v.have() + margin;
         const old_end = v.end.load(.acquire);
         if (pos >= old_end) return null;
-        const mid = pos + (old_end - pos) / 2;
-        if (old_end - mid < settings.min_segment) return null;
+
+        // Split so that both finish together, by what each can be
+        // expected to do: the victim at its own rate, the thief at what a
+        // connection here has been getting — the running mean, or the
+        // usual second's share when the mean is what is left of a slow
+        // tail. Equal rates is half; a 300 KB/s victim against a 1 MB/s
+        // thief hands over three quarters.
+        const expected = @max(if (rate_n > 0) rate_sum / rate_n else 0, d.usualRate() / @as(f64, @floatFromInt(settings.segments)), 1);
+        const left = @as(f64, @floatFromInt(old_end - pos));
+        const take: u64 = @intFromFloat(left * expected / (expected + @max(v.rate, 1)));
+        if (take < (256 << 10)) return null;
+        const mid = old_end - take;
 
         const row = try store.split(d.shared.db, scope, d.id, v.row_id, @intCast(mid), @intCast(segments.items.len), @intCast(old_end));
         defer scope.reset();
         v.end.store(mid, .release);
         const made = try Segment.create(d.shared.worker.gpa, row);
-        d.shared.worker.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d} takes {d} MB from segment {d}", .{ made.index, (old_end - mid) >> 20, v.index }) } });
-        _ = now;
+        d.shared.worker.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d} takes {d} KB from segment {d} at {d} KB/s", .{ made.index, (old_end - mid) >> 10, v.index, @as(u64, @intFromFloat(v.rate / 1024)) }) } });
         return made;
     }
 
@@ -1152,6 +1363,8 @@ const Segment = struct {
     restarts: u8 = 0,
     /// Not before this, after a failure: `Settings.retry_wait_ms`.
     wait_until_ms: i64 = 0,
+    /// Consecutive health checks this segment was under the bar.
+    slow_checks: u8 = 0,
     last_restart_ms: i64 = 0,
     future: ?Io.Future(void) = null,
     last_seen: u64 = 0,
@@ -1501,4 +1714,35 @@ test "an http date is seconds since the epoch, and anything else is nothing" {
 test "a content-range total is parsed, and a star is unknown" {
     try std.testing.expectEqual(@as(?u64, 12345), try totalFromContentRange("bytes 0-0/12345"));
     try std.testing.expectEqual(@as(?u64, null), try totalFromContentRange("bytes 0-0/*"));
+}
+
+test "the link has room when the total falls under the usual second, and a burst is not the usual" {
+    var d: Download = .{ .shared = undefined, .id = 0 };
+    // Three seconds are needed before anything is judged.
+    d.totals[0] = 100;
+    d.totals_n = 1;
+    d.total_rate = 10;
+    try std.testing.expect(!d.linkHasRoom(0));
+    // A burst second, then the rate the link sustains: the usual is the
+    // median, so a steady 10 after a 100 is not room.
+    for ([_]f64{ 100, 10, 10, 10 }) |t| {
+        d.totals[d.totals_n % d.totals.len] = t;
+        d.totals_n += 1;
+    }
+    d.prev_total_rate = 10;
+    d.total_rate = 10;
+    try std.testing.expectEqual(@as(f64, 10), d.usualRate());
+    try std.testing.expect(!d.linkHasRoom(0));
+    // Down to a quarter for one second: room. Down to 0.7 for one: not
+    // yet; for two: room.
+    d.total_rate = 2.5;
+    try std.testing.expect(d.linkHasRoom(0));
+    d.total_rate = 7;
+    try std.testing.expect(!d.linkHasRoom(0));
+    d.prev_total_rate = 7;
+    try std.testing.expect(d.linkHasRoom(0));
+    // And not while holding.
+    d.hold_until_ms = 5000;
+    try std.testing.expect(!d.linkHasRoom(4999));
+    try std.testing.expect(d.linkHasRoom(5000));
 }

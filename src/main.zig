@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
     }
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (isOne(a, &.{ "-n", "-p", "--stall", "--retries", "--retry-wait", "--db", "-o", "-H", "--header", "--sha256", "--dir", "--batch" })) {
+        if (isOne(a, &.{ "-n", "-p", "--stall", "--retries", "--retry-wait", "--db", "-o", "-H", "--header", "--sha256", "--dir", "--batch", "--slow", "--slow-checks", "--slow-per-check", "--steal-min" })) {
             if (i + 1 >= args.len) return usage();
             const v = args[i + 1];
             i += 1;
@@ -106,6 +106,14 @@ pub fn main(init: std.process.Init) !void {
                 settings.retries = std.fmt.parseInt(u8, v, 10) catch return usage();
             } else if (std.mem.eql(u8, a, "--retry-wait")) {
                 settings.retry_wait_ms = std.fmt.parseInt(u32, v, 10) catch return usage();
+            } else if (std.mem.eql(u8, a, "--slow")) {
+                settings.slow_fraction = std.fmt.parseFloat(f64, v) catch return usage();
+            } else if (std.mem.eql(u8, a, "--slow-checks")) {
+                settings.slow_checks = std.fmt.parseInt(u8, v, 10) catch return usage();
+            } else if (std.mem.eql(u8, a, "--slow-per-check")) {
+                settings.slow_per_check = std.fmt.parseInt(u8, v, 10) catch return usage();
+            } else if (std.mem.eql(u8, a, "--steal-min")) {
+                settings.steal_min_secs = std.fmt.parseFloat(f64, v) catch return usage();
             } else if (std.mem.eql(u8, a, "--sha256")) {
                 if (!isSha256Hex(v)) return usage();
                 try sums.append(arena, v);
@@ -257,7 +265,9 @@ fn list(arena: std.mem.Allocator, io: std.Io, db_path: []const u8, json: bool) !
 
 /// No terminal front: the URLs go in, events come out as lines, and the
 /// process ends when the last of them is done or failed. Rows restored
-/// from the database are reported but not waited for; a URL refused as a
+/// from the database are reported but not waited for — unless no URL was
+/// given at all, and then the unfinished ones are what is waited for:
+/// `fdm --headless` finishes what a previous run left. A URL refused as a
 /// duplicate counts as failed, so the exit says so.
 fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, adds: []const download.Add, also: ?i64, json: bool) !void {
     var waiting: std.ArrayList(i64) = .empty;
@@ -272,13 +282,21 @@ fn runHeadless(gpa: std.mem.Allocator, io: std.Io, worker: *download.Worker, add
 
     var failed = false;
     var last_line_ms: i64 = 0;
-    while (pending > 0) {
+    // With nothing given, the worker's report of the rows it restored is
+    // what says whether there is anything to wait for; it comes in the
+    // first batch of events, or there are no rows.
+    const bare = adds.len == 0 and also == null;
+    var settled = !bare;
+    const began = download.nowMs(io);
+    while (pending > 0 or !settled) {
         try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake);
         const now = download.nowMs(io);
         const events = try worker.take();
         defer gpa.free(events);
+        if (events.len > 0 or now - began > 3000) settled = true;
         for (events) |ev| switch (ev) {
-            .added => |a| if (a.state == .queued and !isWaited(waiting.items, a.id) and isOurs(adds, a.url.slice())) {
+            .added => |a| if (a.state == .queued and !isWaited(waiting.items, a.id) and (bare or isOurs(adds, a.url.slice()))) {
+                if (bare) pending += 1;
                 try waiting.append(gpa, a.id);
                 line(json, .{ .event = "added", .id = a.id, .url = a.url.slice(), .path = a.path.slice() }, "{d}: {s} -> {s}", .{ a.id, a.url.slice(), a.path.slice() });
             },
