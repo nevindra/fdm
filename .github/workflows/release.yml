@@ -1,0 +1,38 @@
+# A tag `vX.Y.Z` becomes a GitHub release with one binary per platform,
+# named the way `fdm update` looks for them, and a sha256sums.txt it
+# checks them against. Everything is cross-compiled on one Linux runner;
+# Zig ships the libc for each target.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: build
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for t in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-windows; do
+            zig build -Doptimize=ReleaseSafe -Dtarget=$t -Dversion="$version" --prefix zig-out/$t
+            name="fdm-${t%-gnu}"
+            case $t in
+              *windows*) cp zig-out/$t/bin/fdm.exe "dist/$name.exe" ;;
+              *)         cp zig-out/$t/bin/fdm "dist/$name" ;;
+            esac
+          done
+          cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "fdm $GITHUB_REF_NAME" --generate-notes

@@ -19,30 +19,34 @@
 const std = @import("std");
 const download = @import("download.zig");
 const tui = @import("tui.zig");
+const update = @import("update.zig");
+const builtin = @import("builtin");
 
 /// Where `std.log` goes: a file beside the database, never the terminal
 /// the TUI owns. `nilo_job` logs a line per retry and per dead row, and a
 /// line on stderr in raw mode is a corrupted screen.
 pub const std_options: std.Options = .{ .logFn = logToFile };
 
-var log_fd: ?std.os.linux.fd_t = null;
+var log_io: std.Io = undefined;
+var log_file: ?std.Io.File = null;
+/// Where the next line goes. Positional writes from an atomic offset are
+/// what make this safe from any thread without a lock.
+var log_pos: std.atomic.Value(u64) = .init(0);
 
 fn logToFile(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
-    const fd = log_fd orelse return;
+    const file = log_file orelse return;
     var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s} ({s}): " ++ format ++ "\n", .{ level.asText(), @tagName(scope) } ++ args) catch return;
-    var rest: []const u8 = line;
-    while (rest.len > 0) {
-        const rc = std.os.linux.write(fd, rest.ptr, rest.len);
-        if (std.os.linux.errno(rc) != .SUCCESS) return;
-        rest = rest[rc..];
-    }
+    const at = log_pos.fetchAdd(line.len, .monotonic);
+    file.writePositionalAll(log_io, line, at) catch {};
 }
 
-fn openLog(arena: std.mem.Allocator, db_path: []const u8) void {
-    const path = std.fmt.allocPrintSentinel(arena, "{s}.log", .{db_path}, 0) catch return;
-    const rc = std.os.linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
-    if (std.os.linux.errno(rc) == .SUCCESS) log_fd = @intCast(rc);
+fn openLog(io: std.Io, arena: std.mem.Allocator, db_path: []const u8) void {
+    const path = std.fmt.allocPrint(arena, "{s}.log", .{db_path}) catch return;
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch return;
+    log_pos.store(file.length(io) catch 0, .monotonic);
+    log_io = io;
+    log_file = file;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -54,6 +58,12 @@ pub fn main(init: std.process.Init) !void {
     defer urls.deinit(gpa);
     var db_path: ?[]const u8 = null;
     var headless = false;
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--version")) {
+        std.debug.print("fdm {s}\n", .{update.version});
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "update")) return update.run(gpa, init.io);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -87,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     // The worker creates the directory; the log can only follow it.
     const worker = try download.Worker.start(gpa, settings, db);
     defer worker.stop();
-    openLog(arena, db);
+    openLog(init.io, arena, db);
 
     if (headless) return runHeadless(gpa, init.io, worker, urls.items);
     try tui.run(gpa, init.io, init.environ_map, worker, urls.items);
@@ -146,16 +156,31 @@ fn isWaited(ids: []const i64, id: i64) bool {
     return false;
 }
 
-/// `$XDG_DATA_HOME/fdm/fdm.db`, or `~/.local/share/fdm/fdm.db`.
+/// `$XDG_DATA_HOME/fdm/fdm.db` wherever that is set; otherwise where the
+/// platform keeps a program's data — `~/.local/share`, `~/Library/Application
+/// Support`, `%LOCALAPPDATA%`.
 fn defaultDbPath(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![]const u8 {
     if (env.get("XDG_DATA_HOME")) |xdg| return std.fs.path.join(arena, &.{ xdg, "fdm", "fdm.db" });
-    const home = env.get("HOME") orelse return error.NoHome;
-    return std.fs.path.join(arena, &.{ home, ".local", "share", "fdm", "fdm.db" });
+    switch (builtin.os.tag) {
+        .windows => {
+            const base = env.get("LOCALAPPDATA") orelse env.get("APPDATA") orelse return error.NoHome;
+            return std.fs.path.join(arena, &.{ base, "fdm", "fdm.db" });
+        },
+        .macos => {
+            const home = env.get("HOME") orelse return error.NoHome;
+            return std.fs.path.join(arena, &.{ home, "Library", "Application Support", "fdm", "fdm.db" });
+        },
+        else => {
+            const home = env.get("HOME") orelse return error.NoHome;
+            return std.fs.path.join(arena, &.{ home, ".local", "share", "fdm", "fdm.db" });
+        },
+    }
 }
 
 fn usage() error{Usage} {
     std.debug.print(
         \\usage: fdm [url ...] [-p parallel] [-n segments] [--stall ms] [--retries n] [--db file] [--headless]
+        \\       fdm update | fdm --version
         \\
     , .{});
     return error.Usage;
@@ -166,4 +191,5 @@ test {
     _ = tui;
     _ = @import("store.zig");
     _ = @import("dns.zig");
+    _ = update;
 }

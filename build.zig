@@ -1,5 +1,4 @@
-//! fdm — fast download manager: a worker on nilo_fetch, and a terminal
-//! front over it until the Native SDK window replaces it.
+//! fdm: a worker on nilo_fetch, and a terminal front over it.
 
 const std = @import("std");
 
@@ -11,6 +10,13 @@ pub fn build(b: *std.Build) void {
     // `.sql = true` is what fetches the SQLite driver (nilo's ADR 0075).
     const nilo = b.dependency("nilo", .{ .target = target, .optimize = optimize, .sql = true });
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+
+    // What `fdm --version` says and what `fdm update` compares against.
+    // The release workflow passes the tag; a build without one is behind
+    // every release by definition.
+    const version = b.option([]const u8, "version", "the version this build reports") orelse "0.0.0-dev";
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
 
     // SQLite links libc, and glibc 2.44's `crt1.o` carries an `.sframe`
     // section with relocations Zig 0.16's own ELF linker refuses
@@ -30,6 +36,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "nilo_job", .module = nilo.module("nilo_job") },
                 .{ .name = "nilo_sql", .module = nilo.module("nilo_sql") },
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                .{ .name = "build_options", .module = options.createModule() },
             },
         }),
     });

@@ -1,0 +1,40 @@
+# On a tag, before release.yml publishes it: the tests where they can
+# run, and the binary for every platform a release ships, so a tag that
+# breaks a test or a cross-compile is seen next to its release. Not on
+# every push: a day's commits do not need three runners each. Run it by
+# hand from the Actions tab when a branch wants checking before a tag.
+name: ci
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build test -Doptimize=ReleaseSafe
+      - run: zig build -Doptimize=ReleaseSafe
+
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: build every release target
+        run: |
+          for t in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos x86_64-windows; do
+            zig build -Doptimize=ReleaseSafe -Dtarget=$t --prefix zig-out/$t
+          done
+          ls -la zig-out/*/bin
