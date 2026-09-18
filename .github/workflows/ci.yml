@@ -24,6 +24,10 @@ jobs:
           version: 0.16.0
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig build -Doptimize=ReleaseSafe
+      # The binary against a local server that stalls, cuts and redirects:
+      # on all three, so a release target has run at least once before it
+      # ships (test/e2e.py).
+      - run: zig build e2e -Doptimize=ReleaseSafe
 
   cross:
     runs-on: ubuntu-latest

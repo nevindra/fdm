@@ -1,6 +1,7 @@
 //! fdm: a worker on nilo_fetch, and a terminal front over it.
 
 const std = @import("std");
+const manifest = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -14,7 +15,7 @@ pub fn build(b: *std.Build) void {
     // What `fdm --version` says and what `fdm update` compares against.
     // The release workflow passes the tag; a build without one is behind
     // every release by definition.
-    const version = b.option([]const u8, "version", "the version this build reports") orelse "0.0.0-dev";
+    const version = b.option([]const u8, "version", "the version this build reports") orelse manifest.version ++ "-dev";
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
 
@@ -51,4 +52,14 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = exe.root_module, .use_llvm = true });
     b.step("test", "the unit tests").dependOn(&b.addRunArtifact(tests).step);
+
+    // The built binary against a server that misbehaves on cue: ranges,
+    // stalls, a cut connection resumed on the next run, a redirect, a
+    // wrong hash. Python because the server is forty lines of stdlib.
+    const python = if (target.result.os.tag == .windows) "python" else "python3";
+    const e2e = b.addSystemCommand(&.{ python, "test/e2e.py", "--fdm" });
+    e2e.addArtifactArg(exe);
+    if (b.args) |a| e2e.addArgs(a);
+    e2e.step.dependOn(b.getInstallStep());
+    b.step("e2e", "the end-to-end scenarios: zig build e2e -- -k stall").dependOn(&e2e.step);
 }

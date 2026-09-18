@@ -29,13 +29,15 @@ from `build.zig.zon`, nothing has to sit beside the checkout:
 
 ```
 zig build -Doptimize=ReleaseSafe
+zig build test        # the unit tests
+zig build e2e         # the binary against a local server that stalls, cuts and redirects
 ```
 
-Linux is where it is used; macOS and Windows build and pass the tests in
-CI on every push, and the worker's one platform-specific need — cutting a
-`recv` that has gone quiet from another thread — is something
-`std.Io.Threaded` does on all three. What has not happened yet is a
-person watching a download on the other two.
+Linux is where it is used; macOS and Windows build, pass the tests and
+run the end-to-end scenarios in CI on every tag, and the worker's one
+platform-specific need (cutting a `recv` that has gone quiet from another
+thread) is something `std.Io.Threaded` does on all three. What has not
+happened yet is a person watching a download on the other two.
 
 ## Use
 
@@ -160,7 +162,8 @@ as connections finish rather than splitting it once.
 | `src/theme.zig` | every colour, in one place |
 | `src/update.zig` | `fdm update`: the latest release, checked against its `sha256sums.txt`, renamed over this binary |
 | `src/main.zig` | wiring, the flags, `--headless`, `fdm ls`, and where the database lives on each platform |
-| `.github/workflows` | `ci.yml` tests on all three platforms and cross-builds every target; `release.yml` turns a `v*` tag into a release |
+| `test/e2e.py` | nine runs of the binary against a server in the script that honours or ignores `Range`, stalls, cuts, redirects and names the file; `zig build e2e`, and `-- -k stall` for some of them |
+| `.github/workflows` | `ci.yml` tests and runs the scenarios on all three platforms and cross-builds every target; `release.yml` turns a `v*` tag into a release, refusing one that is not `build.zig.zon`'s version |
 | `bench/compare.py` | curl, aria2, fdm and Surge against the same URLs, in a pty, interleaved; `--variant` for one more fdm with other flags |
 | `bench/local/` | nginx as three kinds of host and `tc` as four kinds of link, so a tail can be measured twice and come out the same |
 | `docs/history.md` | what was tried, measured, and found wrong on the way here |

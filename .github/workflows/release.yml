@@ -19,6 +19,11 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: the tag is the manifest's version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -q "^    \.version = \"$version\"," build.zig.zon || {
+            echo "tag v$version but build.zig.zon says: $(grep '\.version' build.zig.zon)"; exit 1; }
       - name: build
         run: |
           version="${GITHUB_REF_NAME#v}"

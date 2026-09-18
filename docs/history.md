@@ -401,3 +401,11 @@ top and wrote it at the offset it had reached. Every segment on a server
 that slices now asks with a `Range`, sixteen or one, so the retry resumes
 where it was; on a server that does not slice the retry starts at zero,
 which is what the server is going to send.
+
+That bug had lived since the spike because every stall and resume run
+in this file was made by hand against `rangesrv.py`, and by hand is once.
+`test/e2e.py` is those runs kept: nine scenarios against a server in the
+script, each checked by sha256 and by what the server was asked, twelve
+seconds on a laptop, `zig build e2e`. Put the old single-segment
+behaviour back and two of them fail on the hash, which is the test doing
+what the hand runs could not.
