@@ -82,7 +82,8 @@ pub const Settings = struct {
     /// reason. `-n` overrides it; the comparison in `bench/` is what
     /// should move the default.
     segments: u8 = 16,
-    /// Milliseconds a segment may go without a byte before it is cancelled.
+    /// Milliseconds a segment may go without a byte before its call is
+    /// `Stalled` and the segment is restarted on a fresh connection.
     stall_ms: u32 = 10_000,
     /// How many times one segment may be restarted after a stall or an error.
     retries: u8 = 3,
@@ -119,6 +120,11 @@ pub const Settings = struct {
     slow_checks: u8 = 1,
     /// At most this many reconnects in one health check.
     slow_per_check: u8 = 255,
+    /// Bytes each connection reads into at a time: nilo's
+    /// `read_buffer_size`, per connection and on the heap beside it.
+    /// `--read-buffer` on the command line; `docs/history.md` has the
+    /// measurement behind the default.
+    read_buffer: usize = 8 << 10,
 };
 
 /// One download as the person asked for it. The strings are allocated with
@@ -304,10 +310,10 @@ pub const Worker = struct {
 /// `run`, which is what makes a claim after a crash the same call as the
 /// first one.
 ///
-/// `timeout_ms` cannot fire without an Engine, so here it is only the
-/// lease: how long a claimed row is left alone. A day, because a download
-/// may take that long, and `store.releaseStale` is what covers the crash
-/// case that a shorter lease would otherwise cover.
+/// `timeout_ms` here is the job's lease, not a fetch deadline: how long a
+/// claimed row is left alone. A day, because a download may take that
+/// long, and `store.releaseStale` is what covers the crash case that a
+/// shorter lease would otherwise cover.
 const Fetch = struct {
     pub const nilo_job = "fetch";
     pub const timeout_ms = 24 * 60 * 60 * 1000;
@@ -392,28 +398,31 @@ fn threadMain(w: *Worker) void {
     var client: fetch.Client = .init(gpa, .{
         // Three downloads of sixteen segments, and a probe or two.
         .max_in_flight = 64,
-        // The deadline cannot fire without an Engine, so zero is honest; the
-        // stall watchdog in `Download.supervise` is the bound instead.
+        // nilo's deadline bounds a whole call, and a segment's call is the
+        // transfer, which may take hours. Zero here; the probe sets its own
+        // per call. What bounds a segment is silence: `stall_ms` since the
+        // last byte, and the call comes back `Stalled`.
         .timeout_ms = 0,
-        // A refused body is dropped rather than drained: the probe leaves a
-        // whole file unread when the server ignores its Range.
-        .max_drain = 4 << 10,
+        .stall_ms = w.settings.stall_ms,
+        // Per connection, on the heap beside it, and the number that
+        // decides how much one socket read brings in. Sixteen sockets
+        // pulling one file are the case it was exposed for.
+        .read_buffer_size = w.settings.read_buffer,
     });
     defer client.deinit();
-    client.nilo_start(io, .off) catch return;
+    client.nilo_start(io, .none) catch return;
 
     var table = store.JobTable.open(&db);
     var shared: Shared = .{ .worker = w, .client = &client, .db = &db, .jobs = undefined, .io = io };
     defer shared.active.deinit(gpa);
+    // A `push` wakes a worker, so the latency between `add` and the first
+    // byte is the command loop's sleep and nothing else; the poll only
+    // finds a retry that came due, and the default is fine for that.
     var jobs: Jobs = .open(gpa, &table, .{ .shared = &shared }, .{
         .workers = w.settings.parallel,
-        // The latency between `add` and the first byte is this plus the
-        // command loop's sleep: a tenth of a second, against the half
-        // second it was, for one small query per worker per tick.
-        .poll_ms = 100,
     });
     shared.jobs = &jobs;
-    jobs.nilo_start(io, .off) catch return;
+    jobs.nilo_start(io, .none) catch return;
 
     var run: store.Run = .initIo(gpa, io);
     defer run.deinit();
@@ -619,6 +628,10 @@ const Download = struct {
     frontier: u64 = 0,
     /// Length of the file, when known.
     total: ?u64 = null,
+    /// Whether the server honours `Range`. Every segment asks with one
+    /// then, sixteen or one, so a retry resumes where it was; without it
+    /// the server sends the file from the top and the retry starts there.
+    sliceable: bool = false,
     /// The whole download's rate, one sample a second, the last ten kept:
     /// what `reconnectSlow` reads to tell a link that is full from a
     /// connection that is slow.
@@ -836,6 +849,7 @@ const Download = struct {
             try file.setLength(io, total orelse 0);
         }
         d.total = total;
+        d.sliceable = info.ranged;
         d.frontier = if (total) |n| n else std.math.maxInt(u64);
         if (ranged) for (segments.items) |seg| {
             if (seg == segments.items[0]) d.frontier = 0;
@@ -878,10 +892,11 @@ const Download = struct {
         w.post(.{ .done = .{ .id = d.id, .bytes = bytes, .elapsed_ms = nowMs(io) - started } });
     }
 
-    /// Starts every segment, restarts the ones that fail, and cancels the
-    /// ones that stop moving — which is the one thing a deadline would do
-    /// and, without an Engine, nothing else here does. Two more things,
-    /// both about connections not being equal, which is what a CDN is:
+    /// Starts every segment and restarts the ones that fail, which since
+    /// nilo's `stall_ms` includes the ones that stopped moving: a segment
+    /// whose peer went quiet comes back `Stalled` on its own, and takes the
+    /// restart path like any other failure. Two more things, both about
+    /// connections not being equal, which is what a CDN is:
     ///
     /// - **A slow segment is reconnected.** Once a second every running
     ///   segment's rate is sampled; one that has run at least three seconds
@@ -951,7 +966,10 @@ const Download = struct {
                             if (seg.err == error.NoSpaceLeft) return seg.err;
                             seg.failures += 1;
                             seg.wait_until_ms = now + settings.retry_wait_ms;
-                            w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: attempt {d} failed: {t}", .{ seg.index, seg.attempts, seg.err }) } });
+                            if (seg.err == error.Stalled)
+                                w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: no bytes for {d}ms, retrying", .{ seg.index, settings.stall_ms }) } })
+                            else
+                                w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: attempt {d} failed: {t}", .{ seg.index, seg.attempts, seg.err }) } });
                             seg.state.store(.idle, .release);
                         }
                         if (seg.failures > settings.retries) return seg.err;
@@ -966,32 +984,19 @@ const Download = struct {
                             continue;
                         }
                         seg.attempts += 1;
-                        seg.last_seen = seg.have();
-                        seg.last_moved_ms = now;
                         seg.started_ms = now;
                         seg.sample_bytes = seg.have();
                         seg.rate = 0;
                         seg.state.store(.running, .release);
-                        seg.future = try io.concurrent(Segment.run, .{ seg, s.client, file, io, url, headers, ranged });
+                        seg.future = try io.concurrent(Segment.run, .{ seg, s.client, file, io, url, headers, d.sliceable });
                         pending += 1;
                         running += 1;
                     },
                     .running => {
                         pending += 1;
                         running += 1;
-                        const seen = seg.have();
-                        if (seen != seg.last_seen) {
-                            seg.last_seen = seen;
-                            seg.last_moved_ms = now;
-                        } else if (now - seg.last_moved_ms > settings.stall_ms) {
-                            seg.future.?.cancel(io);
-                            seg.future = null;
-                            seg.failures += 1;
-                            seg.wait_until_ms = now + settings.retry_wait_ms;
-                            w.post(.{ .note = .{ .id = d.id, .text = .fmt("segment {d}: no bytes for {d}ms, cancelled and retrying", .{ seg.index, now - seg.last_moved_ms }) } });
-                            seg.state.store(.idle, .release);
-                        }
                         if (sampling) {
+                            const seen = seg.have();
                             seg.rate = @as(f64, @floatFromInt(seen -| seg.sample_bytes));
                             seg.sample_bytes = seen;
                         }
@@ -1113,8 +1118,6 @@ const Download = struct {
         try segments.append(s.worker.gpa, made);
         d.frontier += size;
         made.attempts = 1;
-        made.last_seen = 0;
-        made.last_moved_ms = now;
         made.started_ms = now;
         made.state.store(.running, .release);
         made.future = try s.io.concurrent(Segment.run, .{ made, s.client, file, s.io, url, headers, true });
@@ -1283,12 +1286,18 @@ const Probe = struct {
     location: ?[]const u8,
 };
 
+const probe_timeout_ms = 30_000;
+
 /// One byte, asked for with a Range. A 206 says the server can slice and
 /// how big the whole is; a 200 says it cannot, and the body it started
-/// sending is dropped rather than drained. Either way the answer carries
-/// what identifies the object, for the next run to compare against.
+/// sending is dropped with the connection rather than drained. Either way
+/// the answer carries what identifies the object, for the next run to
+/// compare against.
+///
+/// The one call that gets a deadline, and the one without a stall bound:
+/// it is a head and at most one byte, and a server that takes half a
+/// minute over that is not going to carry sixteen segments.
 fn probe(d: *Download, url: []const u8, headers: Headers, location_buf: *[2048]u8) !Probe {
-    var transfer: [4096]u8 = undefined;
     var redirect: [2048]u8 = undefined;
     var hbuf: [Headers.max + 1]std.http.Header = undefined;
     var ex: fetch.Exchange = .idle;
@@ -1298,11 +1307,11 @@ fn probe(d: *Download, url: []const u8, headers: Headers, location_buf: *[2048]u
         .method = .GET,
         .url = url,
         .headers = headers.with(.{ .name = "range", .value = "bytes=0-0" }, &hbuf),
-        .authorization = headers.authorization,
-        .host = headers.host,
-        .user_agent = headers.user_agent,
-        .redirect_buffer = &redirect,
-        .transfer_buffer = &transfer,
+        .timeout_ms = probe_timeout_ms,
+        // The deadline is the probe's one bound; the client's `stall_ms`
+        // is for the transfers.
+        .stall_ms = 0,
+        .redirects = .{ .follow = &redirect },
     });
     const last_modified: ?Text = if (head.header("last-modified")) |m| .from(m) else null;
     const etag: ?Text = if (head.header("etag")) |e| .from(e) else last_modified;
@@ -1311,21 +1320,19 @@ fn probe(d: *Download, url: []const u8, headers: Headers, location_buf: *[2048]u
         (if (filenameFromDisposition(cd, &name_buf)) |n| .from(n) else null)
     else
         null;
-    // `std.http.Client` rewrites the request's URI as it follows each
-    // redirect, into `redirect` above — so it is copied out here, while
-    // that buffer is still alive.
-    const location: ?[]const u8 = blk: {
-        var w: Io.Writer = .fixed(location_buf);
-        ex.req.uri.format(&w) catch break :blk null;
-        const final = w.buffered();
-        break :blk if (std.mem.eql(u8, final, url)) null else final;
-    };
+    // Where the redirects ended lives in `redirect` above, so it is
+    // written out here, while that buffer is still alive.
+    const location = try head.location(location_buf);
     switch (head.status) {
         .partial_content => {
             const cr = head.header("content-range") orelse return error.NoContentRange;
             return .{ .total = try totalFromContentRange(cr), .ranged = true, .etag = etag, .last_modified = last_modified, .filename = filename, .location = location };
         },
-        .ok => return .{ .total = head.content_length, .ranged = false, .etag = etag, .last_modified = last_modified, .filename = filename, .location = location },
+        .ok => {
+            // The whole file is on its way; nothing here wants it.
+            ex.discard();
+            return .{ .total = head.content_length, .ranged = false, .etag = etag, .last_modified = last_modified, .filename = filename, .location = location };
+        },
         else => {
             d.why = .fmt("HTTP {d} {s}", .{ @intFromEnum(head.status), head.status.phrase() orelse "" });
             return error.BadStatus;
@@ -1373,8 +1380,6 @@ const Segment = struct {
     slow_checks: u8 = 0,
     last_restart_ms: i64 = 0,
     future: ?Io.Future(void) = null,
-    last_seen: u64 = 0,
-    last_moved_ms: i64 = 0,
     started_ms: i64 = 0,
     finished_ms: i64 = 0,
     /// Bytes per second over the last sample, for the health check. Kept
@@ -1427,21 +1432,30 @@ const Segment = struct {
     }
 
     fn runInner(seg: *Segment, client: *fetch.Client, file: Io.File, io: Io, url: []const u8, headers: Headers, ranged: bool) !void {
-        // Both buffers live on this task's stack for the life of the
-        // transfer. The writer's buffer is not optional: `std.Io.net`'s
-        // stream writes straight into it and asserts on an empty one.
-        var transfer: [64 << 10]u8 = undefined;
+        // The writer's buffer lives on this task's stack for the life of
+        // the transfer, and is not optional: `std.Io.net`'s stream writes
+        // straight into it and asserts on an empty one. There is no read
+        // buffer to match it: `stream` goes from the connection's own
+        // buffer to the writer, and `Settings.read_buffer` sizes that one.
         var wbuf: [64 << 10]u8 = undefined;
         var redirect: [2048]u8 = undefined;
         var range_buf: [64]u8 = undefined;
         var hbuf: [Headers.max + 1]std.http.Header = undefined;
 
+        // A server that cannot slice sends the file from the top, so a
+        // retry takes it from there: what an earlier attempt wrote is
+        // written over, not appended to at its offset.
+        if (!ranged) seg.done.store(0, .monotonic);
         const from = seg.start + seg.have();
         // Read once: a steal can move `end` between the request and its
         // answer, and the answer is measured against what was asked. The
         // read loop below follows the atomic and stops at the new boundary.
         const asked_end = seg.end.load(.acquire);
-        const range = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ from, asked_end -| 1 });
+        const open_ended = asked_end == std.math.maxInt(u64);
+        const range = if (open_ended)
+            try std.fmt.bufPrint(&range_buf, "bytes={d}-", .{from})
+        else
+            try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ from, asked_end - 1 });
         const sent = headers.with(if (ranged) .{ .name = "range", .value = range } else null, &hbuf);
 
         var ex: fetch.Exchange = .idle;
@@ -1450,18 +1464,14 @@ const Segment = struct {
             .method = .GET,
             .url = url,
             .headers = sent,
-            .authorization = headers.authorization,
-            .host = headers.host,
-            .user_agent = headers.user_agent,
-            .redirect_buffer = &redirect,
-            .transfer_buffer = &transfer,
+            .redirects = .{ .follow = &redirect },
         });
 
         if (ranged) {
             // A 200 here is the whole file; writing it at `from` would
             // corrupt everything after it. Refuse before a byte lands.
             if (head.status != .partial_content) return error.RangeIgnored;
-            if (head.content_length) |n| if (n != asked_end - from) return error.LengthMismatch;
+            if (!open_ended) if (head.content_length) |n| if (n != asked_end - from) return error.LengthMismatch;
         } else if (head.status != .ok) return error.BadStatus;
 
         var fw = file.writer(io, &wbuf);
@@ -1477,19 +1487,21 @@ const Segment = struct {
         }
         // Never past `end`, read fresh each time: a steal may have moved it
         // closer since the request was made. What the server still sends
-        // after that is dropped with the connection.
-        const reader = ex.reader orelse unreachable;
+        // after that is dropped with the connection. One chunk a call,
+        // through the Exchange rather than off `ex.reader`, so the read is
+        // inside the stall clock: a peer that goes quiet ends it as
+        // `Stalled` rather than holding this task on a `recv` forever.
         while (true) {
             const end = seg.end.load(.acquire);
             const want: u64 = end - @min(end, fw.logicalPos());
             if (want == 0) break;
-            _ = reader.stream(&fw.interface, .limited64(want)) catch |err| switch (err) {
-                error.EndOfStream => break,
+            const moved = ex.stream(&fw.interface, .limited64(want)) catch |err| switch (err) {
                 // The file's own error is the one worth reporting — a
                 // full disk is `NoSpaceLeft` there and `WriteFailed` here.
                 error.WriteFailed => return fw.err orelse err,
                 else => return err,
             };
+            if (moved == 0) break;
             seg.done.store(fw.pos - seg.start, .monotonic);
         }
         fw.interface.flush() catch |err| return fw.err orelse err;
@@ -1501,14 +1513,12 @@ const Segment = struct {
 
 // ---------------------------------------------------------------- headers
 
-/// What goes out with every request for one download, read off the row.
-/// Three names are kept apart because `std.http.Client` writes them itself
-/// and would otherwise send them twice; the rest go verbatim, in order.
+/// What goes out with every request for one download, read off the row,
+/// verbatim and in order. A name `std.http.Client` has a slot of its own
+/// for (`host`, `authorization`, `user-agent`) goes out once, this copy:
+/// nilo tells std to leave its slot out, so nothing is routed by hand here.
 const Headers = struct {
     extra: []const std.http.Header = &.{},
-    authorization: ?[]const u8 = null,
-    host: ?[]const u8 = null,
-    user_agent: ?[]const u8 = null,
 
     /// More than a browser's "Copy as cURL" produces.
     const max = 32;
@@ -1525,23 +1535,18 @@ const Headers = struct {
             const name = std.mem.trim(u8, line[0..colon], " \t\r");
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
             if (name.len == 0) continue;
-            if (std.ascii.eqlIgnoreCase(name, "authorization")) {
-                h.authorization = value;
-            } else if (std.ascii.eqlIgnoreCase(name, "host")) {
-                h.host = value;
-            } else if (std.ascii.eqlIgnoreCase(name, "user-agent")) {
-                h.user_agent = value;
-            } else if (std.ascii.eqlIgnoreCase(name, "connection") or
+            if (std.ascii.eqlIgnoreCase(name, "connection") or
                 std.ascii.eqlIgnoreCase(name, "accept-encoding") or
                 std.ascii.eqlIgnoreCase(name, "content-length"))
             {
-                // The client decides these: the body is read uncompressed,
-                // the connection is kept, and there is no body to measure.
+                // The client decides these: the body is read uncompressed
+                // (an `accept-encoding` pasted from a browser would ask for
+                // gzip the client cannot undo), the connection is kept, and
+                // there is no body to measure.
                 continue;
-            } else {
-                if (list.items.len == max) return error.TooManyHeaders;
-                try list.append(gpa, .{ .name = name, .value = value });
             }
+            if (list.items.len == max) return error.TooManyHeaders;
+            try list.append(gpa, .{ .name = name, .value = value });
         }
         h.extra = try list.toOwnedSlice(gpa);
         return h;
@@ -1679,23 +1684,25 @@ test "the name is the last path segment without the query" {
     try std.testing.expectEqualStrings("download", nameFromUrl("https://x.y/"));
 }
 
-test "headers: authorization, host and user-agent are set apart, the client's own are dropped, the rest kept in order" {
+test "headers: the client's own are dropped, the rest kept verbatim and in order" {
     const gpa = std.testing.allocator;
     const h = try Headers.parse(gpa, "Cookie: a=b\nAuthorization: Bearer t\nHost: x.y\nConnection: close\nuser-agent: Mozilla/5.0\nnocolon\nReferer: https://x.y/\n");
     defer h.free(gpa);
-    try std.testing.expectEqualStrings("Bearer t", h.authorization.?);
-    try std.testing.expectEqualStrings("x.y", h.host.?);
-    try std.testing.expectEqualStrings("Mozilla/5.0", h.user_agent.?);
-    try std.testing.expectEqual(@as(usize, 2), h.extra.len);
+    try std.testing.expectEqual(@as(usize, 5), h.extra.len);
     try std.testing.expectEqualStrings("Cookie", h.extra[0].name);
     try std.testing.expectEqualStrings("a=b", h.extra[0].value);
-    try std.testing.expectEqualStrings("Referer", h.extra[1].name);
+    try std.testing.expectEqualStrings("Authorization", h.extra[1].name);
+    try std.testing.expectEqualStrings("Bearer t", h.extra[1].value);
+    try std.testing.expectEqualStrings("Host", h.extra[2].name);
+    try std.testing.expectEqualStrings("user-agent", h.extra[3].name);
+    try std.testing.expectEqualStrings("Mozilla/5.0", h.extra[3].value);
+    try std.testing.expectEqualStrings("Referer", h.extra[4].name);
 
     var buf: [Headers.max + 1]std.http.Header = undefined;
     const sent = h.with(.{ .name = "range", .value = "bytes=0-0" }, &buf);
-    try std.testing.expectEqual(@as(usize, 3), sent.len);
+    try std.testing.expectEqual(@as(usize, 6), sent.len);
     try std.testing.expectEqualStrings("range", sent[0].name);
-    try std.testing.expectEqual(@as(usize, 2), h.with(null, &buf).len);
+    try std.testing.expectEqual(@as(usize, 5), h.with(null, &buf).len);
 }
 
 test "content-disposition: a plain name, a starred one over it, and no path" {

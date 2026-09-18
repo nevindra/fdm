@@ -59,12 +59,6 @@ connections finish; what sequential adds is a bound on how far ahead of
 the lowest unfinished byte the frontier may go, and a steal that never
 takes the head. Costs: one number, and a rule in the steal.
 
-**A wake for the queue.** `nilo_job` polls, and the poll is the latency
-between `add` and the first byte; it is 100 ms now and was 500. A push
-that wakes a sleeping worker would make it nothing and let the poll go
-back to a second, for an idle TUI that then asks SQLite once a second
-rather than thirty times. Costs: one condition variable in nilo.
-
 **Pre-warmed connections, so a reconnect does not pay the handshake.**
 *Surge `dial_hedge_count` 4.* A pool of open connections to the host,
 kept ahead of demand, so a reconnected or stolen segment starts sending

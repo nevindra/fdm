@@ -36,9 +36,11 @@ const Release = struct {
 };
 
 pub fn run(gpa: std.mem.Allocator, io: Io) !void {
-    var client: fetch.Client = .init(gpa, .{ .max_in_flight = 4, .timeout_ms = 0, .max_body = 128 << 20 });
+    // Two minutes covers a binary over a slow link; the release JSON is
+    // a second of that.
+    var client: fetch.Client = .init(gpa, .{ .max_in_flight = 4, .timeout_ms = 120_000, .max_body = 128 << 20 });
     defer client.deinit();
-    try client.nilo_start(io, .off);
+    try client.nilo_start(io, .none);
     var scope: core.Run = .initIo(gpa, io);
     defer scope.deinit();
 

@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
     }
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (isOne(a, &.{ "-n", "-p", "--stall", "--retries", "--retry-wait", "--db", "-o", "-H", "--header", "--sha256", "--dir", "--batch", "--slow", "--slow-checks", "--slow-per-check", "--steal-min" })) {
+        if (isOne(a, &.{ "-n", "-p", "--stall", "--retries", "--retry-wait", "--db", "-o", "-H", "--header", "--sha256", "--dir", "--batch", "--slow", "--slow-checks", "--slow-per-check", "--steal-min", "--read-buffer" })) {
             if (i + 1 >= args.len) return usage();
             const v = args[i + 1];
             i += 1;
@@ -114,6 +114,8 @@ pub fn main(init: std.process.Init) !void {
                 settings.slow_per_check = std.fmt.parseInt(u8, v, 10) catch return usage();
             } else if (std.mem.eql(u8, a, "--steal-min")) {
                 settings.steal_min_secs = std.fmt.parseFloat(f64, v) catch return usage();
+            } else if (std.mem.eql(u8, a, "--read-buffer")) {
+                settings.read_buffer = std.fmt.parseInt(usize, v, 10) catch return usage();
             } else if (std.mem.eql(u8, a, "--sha256")) {
                 if (!isSha256Hex(v)) return usage();
                 try sums.append(arena, v);

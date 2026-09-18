@@ -7,8 +7,8 @@
         // Pinned to a nilo commit, so a clone builds with nothing beside it.
         // To work on both at once, swap this for `.path = "../nilo"`.
         .nilo = .{
-            .url = "git+https://github.com/nevindra/nilo#8c2d3be149571fc1629604076c1afb13e80f92c7",
-            .hash = "nilo-0.4.0-5HEqws8fSwCKDzQP-fxXKnkB-CrONXXIn-6BQgYxI5if",
+            .url = "git+https://github.com/nevindra/nilo#59405247981871e3b0a556ced2877a956496e798",
+            .hash = "nilo-0.4.0-5HEqwp-ATACRoYdGkBolYnai1uM5fn74E8_p0xlKRgYN",
         },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis#f37c42a3b324131c131d066767968e1f5b976453",

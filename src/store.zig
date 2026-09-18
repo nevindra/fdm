@@ -2,7 +2,8 @@
 //! statements the worker makes against them.
 //!
 //! The Rows are the schema. `sql.migrate.createMissing` builds both tables
-//! from the structs below on first open, and `nilo_sql` checks every
+//! from the structs below on first open, `addMissingColumns` adds a field
+//! that arrived after that to a file already in use, and `nilo_sql` checks every
 //! statement against them while compiling — so a column renamed here and
 //! not there is a build error rather than a `no such column` at run time.
 //!
@@ -25,7 +26,10 @@ pub const JobTable = job.Table(Db);
 pub const State = enum { queued, running, done, failed, cancelled };
 
 pub const Download = struct {
-    pub const nilo_table = .{ .name = "downloads", .key = .id };
+    // `named` has a default because it arrived after the first release:
+    // a file from before it gets the column with the rows it already has
+    // filled in, which is what `addMissingColumns` needs to add it.
+    pub const nilo_table = .{ .name = "downloads", .key = .id, .default = .{ .named = false } };
 
     id: i64,
     url: []const u8,
@@ -67,44 +71,24 @@ pub const Segment = struct {
 };
 
 /// Open the file — creating it and the directory above it — and make sure
-/// both tables exist.
+/// the tables exist and have every column the Rows name. A field added to
+/// a Row after a release is one `ALTER TABLE … ADD COLUMN` on the file a
+/// user already has, with the type and default `createMissing` would have
+/// written; a field that is required and has no default is refused as
+/// `NeedsBackfill`, which is the moment to write a real migration instead.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Db {
     if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
 
     var db: Db = .init(gpa, path, .{ .size = 2 });
     errdefer db.deinit();
-    try db.nilo_start(io, .off);
+    try db.nilo_start(io, .none);
 
     var run: Run = .initIo(gpa, io);
     defer run.deinit();
-    try sql.migrate.createMissing(&db, &run, &.{ Download, Segment, JobTable.Row });
-    try addMissingColumns(&db, &run);
+    const tables = &.{ Download, Segment, JobTable.Row };
+    try sql.migrate.createMissing(&db, &run, tables);
+    _ = try sql.migrate.addMissingColumns(&db, &run, tables);
     return db;
-}
-
-/// Columns that came after the first release, put onto a file made before
-/// them. `createMissing` creates a table that is not there and leaves one
-/// that is, so each of these is one `ALTER TABLE` when `pragma_table_info`
-/// does not list it. The types are the ones `createMissing` writes for the
-/// same fields, so a file made either way is the same file.
-fn addMissingColumns(db: *Db, run: *Run) !void {
-    const added = [_]struct { name: []const u8, sql: []const u8 }{
-        .{ .name = "headers", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"headers\" TEXT" },
-        .{ .name = "named", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"named\" INTEGER NOT NULL DEFAULT 0" },
-        .{ .name = "sha256", .sql = "ALTER TABLE \"downloads\" ADD COLUMN \"sha256\" TEXT" },
-    };
-    const Col = struct {
-        pub const nilo_table = .projection;
-        name: []const u8,
-    };
-    const have = try db.raw(Col, run, "SELECT name FROM pragma_table_info('downloads')", .{});
-    for (added) |col| {
-        var found = false;
-        for (have) |h| if (std.mem.eql(u8, h.name, col.name)) {
-            found = true;
-        };
-        if (!found) _ = try db.exec(run, col.sql, .{});
-    }
 }
 
 /// **One process owns this file**, so a job row that is `running` when the
@@ -299,13 +283,21 @@ test "a file from before `headers` and `named` gets both columns on open" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const uri = "file:fdm_store_old?mode=memory&cache=shared";
+    // A real file rather than `mode=memory&cache=shared`: nilo's
+    // `addMissingColumns` reads the live columns on one pooled connection
+    // while another holds the transaction the `ALTER`s go through, and a
+    // shared-cache database answers that with `SQLITE_LOCKED` where a
+    // file lets the reader through. Filed with nilo; a user's database is
+    // a file, so this is the case that matters.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var uri_buf: [128]u8 = undefined;
+    const uri = try std.fmt.bufPrint(&uri_buf, ".zig-cache/tmp/{s}/old.db", .{&tmp.sub_path});
 
-    // The first release's table, made by hand; the connection keeps the
-    // in-memory file alive for the `open` below.
+    // The first release's table, made by hand.
     var old: Db = .init(std.testing.allocator, uri, .{ .size = 1 });
     defer old.deinit();
-    try old.nilo_start(io, .off);
+    try old.nilo_start(io, .none);
     var run: Run = .initIo(std.testing.allocator, io);
     defer run.deinit();
     _ = try old.exec(&run,

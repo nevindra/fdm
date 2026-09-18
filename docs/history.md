@@ -286,3 +286,118 @@ tests, which is why every variant was a flag rather than a rebuild:
 `--slow`, `--slow-checks`, `--slow-per-check`, `--steal-min`, and
 `compare.py --variant name=flags` runs one more fdm beside the default.
 
+
+## What nilo took back
+
+Six workarounds above leaned on nilo where it stood: `poll_ms` cut to
+100 because a `push` woke nobody, `timeout_ms = 0` because the deadline
+needed an Engine to fire, the URL a redirect ended at read off
+`ex.req.uri` because nothing else said it, `max_drain` lowered on the
+whole client so the probe could drop a 200 it had asked one byte of,
+`Authorization`/`Host`/`User-Agent` routed by hand into `Begin`'s slots,
+and `store.open` reading `pragma_table_info` to `ALTER TABLE` by itself.
+That went to nilo as feedback and came back as nilo `7dfa14a` (ADR 0229
+to 0235). Each one is gone:
+
+- **A `push` wakes a worker**, so `poll_ms` is the default again and only
+  finds a retry that came due. Add-to-first-byte is the command loop's
+  50 ms and nothing else; the idle TUI asks SQLite once a second per
+  worker rather than ten times.
+- **The probe has a 30 s deadline**, and it fires: a black hole that used
+  to hang until the kernel gave up on the connect is `TimedOut` at 30.1 s.
+  The segment calls stay unbounded on purpose. nilo's deadline is on the
+  whole call and a segment's call is the transfer, which may take hours,
+  so the stall watchdog in `supervise` is still the bound that matters
+  for them.
+- **`head.location(&buf)`** is where the redirect ended, so the probe no
+  longer reaches into std's request. `mirrors.kernel.org` still goes to
+  its edge once: 38.6 MB in 5.3 s on 8 segments.
+- **`ex.discard()`** on a 200 to the range probe drops the connection with
+  the body, and `max_drain` is back to nilo's default for every other
+  call. `httpbin.org/bytes`, which ignores `Range`, comes down as one
+  segment as before.
+- **A header std has a slot for goes out once, the caller's copy**, so
+  `Headers` no longer sets `Authorization`, `Host` and `User-Agent` apart:
+  a pasted `curl` line goes into `headers` as it is. `Connection`,
+  `Accept-Encoding` and `Content-Length` are still dropped, for the same
+  reason as before.
+- **`sql.migrate.addMissingColumns`** replaces the hand-written
+  `pragma_table_info` loop: one `ALTER TABLE` per field a shipped table
+  lacks, with the type and default the Row says. `named` had to say
+  `.default = .{ .named = false }` in the marker for it, which is a truer
+  record than a `DEFAULT 0` in a string.
+
+One thing it found. `addMissingColumns` reads the live columns through the
+pool while its own transaction holds another connection, and a
+`mode=memory&cache=shared` database answers the second connection with
+`SQLITE_LOCKED` where a file lets it through. The store's migration test
+ran on shared cache and now runs on a temp file, which is what a user's
+database is anyway; the finding is in nilo's `docs/input_from_fdm.md`.
+
+And one number that was not measured before. `transfer_buffer` on a
+segment was 64 KiB, sixteen of them a download, on the guide's word that
+bigger is fewer trips. `std.http.bodyReader` streams a `content-length`
+body from the connection's own buffer to the writer without touching it,
+and `/proc/<pid>/io` agrees: 38.8 MB on one segment is 15,000 to 20,000
+reads with 64 KiB and the same with 0. What sets the read size is std's
+`read_buffer_size`, 8 KiB, which nilo does not expose yet.
+
+
+## What nilo took back, the second time
+
+The measurement above and what stayed behind went to nilo as the second
+round, and came back as nilo `a3a201e` (ADR 0237 to 0240). What moved:
+
+- **The stall watchdog is nilo's `stall_ms`.** The client is started with
+  `.stall_ms = settings.stall_ms` and `.timeout_ms = 0`, the segment loop
+  reads its chunks through `ex.stream` so the read is inside that clock,
+  and a peer that goes quiet ends the call as `error.Stalled`, which takes
+  the restart path every other failure takes. `last_seen`,
+  `last_moved_ms`, the 100 ms comparison in `supervise` and the
+  `future.cancel` inside it are gone; the probe says `.stall_ms = 0` and
+  keeps its 30 s deadline as its one bound. Against a server that sends
+  half the body and holds the socket, `--stall 2000` restarts the segment
+  at 2,054 ms and the hash matches, on a server that slices and on one
+  that does not.
+- **`redirects = .{ .follow = &buf }`** in place of `redirect_buffer`, on
+  the probe and the segment: the two calls that follow now say so.
+- **The 64 KiB `transfer_buffer` per segment is gone**, and the 4 KiB on
+  the probe with it. Nothing crossed either. `read_buffer_size` is the
+  number that was supposed to decide a read's size, so it is `--read-buffer`
+  and it was measured: sixteen segments on `ls-lR.gz`, `syscr` from
+  `/proc/<pid>/io`, two runs each:
+
+  | `--read-buffer` | reads |
+  |---|---|
+  | 8 KiB (std's default) | 17,778 and 17,895 |
+  | 64 KiB | 17,816 and 17,065 |
+  | 256 KiB | 16,428 and 16,746 |
+
+  About 2.2 KB a read whichever, which is what std's TLS reader takes at
+  a time (one record's header, then its body) rather than what the
+  connection's buffer could hold. The default stays at std's 8 KiB, and
+  the flag stays for the day a plain-HTTP server or a different TLS
+  reader makes it worth asking again.
+
+Two things it did not take.
+
+- **`head.keep(c)` does not fit here.** The probe's head is read before
+  any body, and what outlives the call outlives every `scope.reset()` in
+  `runInner` too, which an arena copy does not. `Text` is the right shape
+  for that, and it is what every event carries anyway.
+- **`Exchange.stream` said zero was the end of the body, and over TLS it
+  was not.** The first run against `mirrors.kernel.org` ended every
+  segment `ShortBody` inside 300 KB: std's TLS reader answers zero for a
+  record with no application data, and for one it decrypted into its own
+  buffer. The old loop on `ex.reader.stream` had been ignoring the return
+  value, which is why nobody had seen it. Fixed in nilo `5940524`, whose
+  `stream` reads on until a byte moves or the stream ends, and that is
+  the commit `build.zig.zon` pins.
+
+And one thing found on the way, in fdm rather than nilo. A single
+segment, the whole file, was sent with no `Range` header at all, so a
+retry after a stall or a dropped connection asked for the file from the
+top and wrote it at the offset it had reached. Every segment on a server
+that slices now asks with a `Range`, sixteen or one, so the retry resumes
+where it was; on a server that does not slice the retry starts at zero,
+which is what the server is going to send.

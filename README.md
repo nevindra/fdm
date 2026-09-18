@@ -54,7 +54,7 @@ are read, and the rest of curl's options are skipped.
 | flag | default | what |
 |---|---|---|
 | `-o` | | where the n-th URL goes: a file, or a directory when it ends in `/` or is one |
-| `-H` | | a `Name: value` sent with every request for these URLs; repeatable. `Authorization`, `Host` and `User-Agent` go where `std.http` wants them |
+| `-H` | | a `Name: value` sent with every request for these URLs; repeatable. A name `std.http` has a slot for (`Authorization`, `Host`, `User-Agent`) goes out once, yours |
 | `--sha256` | | what the n-th URL's file must hash to; a mismatch fails it and keeps the file |
 | `--dir` | the cwd | where a URL without `-o` lands |
 | `--batch` | | a file with one URL, or one `curl` line, per line; `#` comments, `\` continues a line, `url sha256=<hex>` |
@@ -62,6 +62,7 @@ are read, and the rest of curl's options are skipped.
 | `-n` | 16 | connections per download |
 | `-p` | 3 | downloads running at once; the rest queue |
 | `--stall` | 10000 | ms a segment may go without a byte before it is reconnected |
+| `--read-buffer` | 8192 | bytes each connection reads into at a time; measured at nothing over TLS, see `docs/history.md` |
 | `--retries` | 3 | attempts per segment, and per probe, before the download fails |
 | `--retry-wait` | 0 | ms a failed segment waits before its next attempt |
 | `--slow` | 0.3 | a segment under this fraction of the others' mean is reconnected; 0 turns it off |
@@ -174,8 +175,8 @@ instead without `download.zig` changing.
 - **A job's `timeout_ms` is only a lease.** Without an Engine the deadline
   never fires, so it is a day and `store.releaseStale` resets `running`
   rows at start — right for one process owning the file, wrong for two.
-- **Stack per segment**: two 64 KiB buffers plus what `std.http.Client`
-  holds for TLS. Thirty-two open segments is ~6 MB in buffers alone.
+- **Stack per segment**: a 64 KiB write buffer plus what `std.http.Client`
+  holds for TLS. Thirty-two open segments is ~4 MB in buffers alone.
 - **`-fllvm` is forced** in `build.zig`: glibc 2.44's `crt1.o` carries an
   `.sframe` section Zig 0.16's own linker refuses, and `-flld` alone
   crashes the compiler. Debug builds pay a few seconds for it.
